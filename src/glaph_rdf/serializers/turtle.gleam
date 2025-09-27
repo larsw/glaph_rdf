@@ -24,6 +24,21 @@ const xsd_double = "http://www.w3.org/2001/XMLSchema#double"
 
 const xsd_boolean = "http://www.w3.org/2001/XMLSchema#boolean"
 
+/// A complete Turtle document with base IRI, prefixes, and RDF graph content.
+///
+/// Represents a parsed or serializable Turtle document containing all the
+/// components: optional base IRI for resolving relative references, namespace
+/// prefixes for abbreviated IRIs, and the RDF graph containing the actual data.
+/// Supports RDF-star quoted triples with `<< >>` syntax.
+///
+/// ## Examples
+/// ```gleam
+/// TurtleDocument(
+///   base: Some("http://example.org/"),
+///   prefixes: dict.from_list([("ex", "http://example.org/"), ("foaf", "http://xmlns.com/foaf/0.1/")]),
+///   graph: my_rdf_graph
+/// )
+/// ```
 pub type TurtleDocument {
   TurtleDocument(
     base: Option(String),
@@ -32,6 +47,19 @@ pub type TurtleDocument {
   )
 }
 
+/// Error information from Turtle parsing operations.
+///
+/// Contains detailed error information including a descriptive message
+/// and the character position where the error occurred in the input text.
+/// This enables precise error reporting for debugging Turtle syntax issues.
+///
+/// ## Examples
+/// ```gleam
+/// TurtleError(
+///   message: "Unexpected character '<' at position 42", 
+///   position: 42
+/// )
+/// ```
 pub type TurtleError {
   TurtleError(message: String, position: Int)
 }
@@ -72,20 +100,97 @@ type ParserState {
   ParserState(tokens: List(Token))
 }
 
+/// Parse a Turtle document from text into a structured representation.
+///
+/// Parses complete Turtle syntax including base declarations, prefix definitions,
+/// and RDF triples. Supports RDF-star quoted triples with `<< >>` syntax for
+/// metadata and provenance. Returns detailed error information on parse failures.
+///
+/// ## Examples
+/// ```gleam
+/// let turtle_text = "@prefix ex: <http://example.org/> .
+///                    ex:alice ex:name \"Alice\" ."
+/// 
+/// case turtle.parse(turtle_text) {
+///   Ok(document) -> {
+///     // Access document.base, document.prefixes, document.graph
+///   }
+///   Error(turtle.TurtleError(message, position)) -> {
+///     // Handle parsing error with specific position
+///   }
+/// }
+/// ```
 pub fn parse(text: String) -> Result(TurtleDocument, TurtleError) {
   tokenize(text)
   |> result.try(parse_tokens)
 }
 
+/// Parse a Turtle document and extract only the RDF graph content.
+///
+/// Convenience function that parses Turtle text and returns just the RDF graph,
+/// discarding base IRI and prefix declarations. Useful when you only need the
+/// actual RDF data without the document metadata.
+///
+/// ## Examples
+/// ```gleam
+/// let turtle_text = "@prefix ex: <http://example.org/> .
+///                    ex:alice ex:name \"Alice\" ."
+/// 
+/// case turtle.parse_graph(turtle_text) {
+///   Ok(rdf_graph) -> {
+///     let triple_count = graph.size(rdf_graph)
+///     // Work with the RDF graph directly
+///   }
+///   Error(error) -> // Handle parsing error
+/// }
+/// ```
 pub fn parse_graph(text: String) -> Result(graph.Graph, TurtleError) {
   parse(text)
   |> result.map(fn(doc) { doc.graph })
 }
 
+/// Serialize a TurtleDocument to Turtle format text.
+///
+/// Converts a structured Turtle document back to valid Turtle syntax text.
+/// Automatically handles IRI escaping, prefix usage, literal formatting, and
+/// RDF-star quoted triple serialization with `<< >>` syntax. Output is
+/// well-formatted and compliant with W3C Turtle specifications.
+///
+/// ## Examples
+/// ```gleam
+/// let turtle_text = turtle.serialize(my_document)
+/// 
+/// // Result might look like:
+/// // @base <http://example.org/> .
+/// // @prefix ex: <http://example.org/> .
+/// // @prefix foaf: <http://xmlns.com/foaf/0.1/> .
+/// // 
+/// // ex:alice foaf:name "Alice" .
+/// ```
 pub fn serialize(document: TurtleDocument) -> String {
   serialize_document(document)
 }
 
+/// Serialize an RDF graph to Turtle format with custom base and prefixes.
+///
+/// Convenience function that creates a TurtleDocument from the provided
+/// components and serializes it to Turtle text. Allows direct serialization
+/// of RDF graphs with custom base IRI and prefix definitions without
+/// manually constructing a TurtleDocument.
+///
+/// ## Examples
+/// ```gleam
+/// let prefixes = dict.from_list([
+///   ("ex", "http://example.org/"),
+///   ("foaf", "http://xmlns.com/foaf/0.1/")
+/// ])
+/// 
+/// let turtle_text = turtle.serialize_graph(
+///   my_rdf_graph,
+///   Some("http://example.org/"),
+///   prefixes
+/// )
+/// ```
 pub fn serialize_graph(
   graph_value: graph.Graph,
   base: Option(String),

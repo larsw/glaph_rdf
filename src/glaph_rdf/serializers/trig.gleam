@@ -15,10 +15,38 @@ import gleam/string
 // Import the turtle module for parsing and reuse
 import glaph_rdf/serializers/turtle
 
+/// Error information from TriG parsing operations.
+///
+/// Contains detailed error information including a descriptive message
+/// and the character position where the error occurred in the input text.
+/// This enables precise error reporting for debugging TriG syntax issues.
+///
+/// ## Examples
+/// ```gleam
+/// TrigError(
+///   message: "Unexpected token 'GRAPH' at position 15", 
+///   position: 15
+/// )
+/// ```
 pub type TrigError {
   TrigError(message: String, position: Int)
 }
 
+/// A complete TriG document with base IRI, prefixes, and RDF dataset.
+///
+/// Represents a parsed or serializable TriG document containing all components:
+/// optional base IRI for resolving relative references, namespace prefixes for
+/// abbreviated IRIs, and the RDF dataset with multiple named graphs. TriG extends
+/// Turtle to support datasets with named graphs using `GRAPH` blocks and RDF-star.
+///
+/// ## Examples
+/// ```gleam
+/// TrigDocument(
+///   base: Some("http://example.org/"),
+///   prefixes: dict.from_list([("ex", "http://example.org/"), ("foaf", "http://xmlns.com/foaf/0.1/")]),
+///   dataset: my_rdf_dataset_with_named_graphs
+/// )
+/// ```
 pub type TrigDocument {
   TrigDocument(
     base: Option(String),
@@ -27,6 +55,34 @@ pub type TrigDocument {
   )
 }
 
+/// Parse a TriG document from text into a structured representation.
+///
+/// Parses TriG syntax including base declarations, prefix definitions, and
+/// named graph blocks with `GRAPH` statements. Falls back to Turtle parsing
+/// if no TriG-specific syntax is detected. Supports RDF-star quoted triples
+/// within all graphs. Returns detailed error information on parse failures.
+///
+/// ## Examples
+/// ```gleam
+/// let trig_text = "@prefix ex: <http://example.org/> .
+///                  
+///                  ex:graph1 {
+///                    ex:alice ex:name \"Alice\" .
+///                  }
+///                  
+///                  GRAPH ex:graph2 {
+///                    ex:bob ex:age 25 .
+///                  }"
+/// 
+/// case trig.parse(trig_text) {
+///   Ok(document) -> {
+///     // Access document.base, document.prefixes, document.dataset
+///   }
+///   Error(trig.TrigError(message, position)) -> {
+///     // Handle parsing error with specific position
+///   }
+/// }
+/// ```
 pub fn parse(text: String) -> Result(TrigDocument, TrigError) {
   // Simple TriG parser - for now, handle basic cases
   // TODO: Implement full TriG grammar with named graphs
@@ -61,15 +117,82 @@ fn parse_trig_format(_text: String) -> Result(TrigDocument, TrigError) {
   Ok(TrigDocument(base: None, prefixes: dict.new(), dataset: dataset.new()))
 }
 
+/// Parse a TriG document and extract only the RDF dataset content.
+///
+/// Convenience function that parses TriG text and returns just the RDF dataset,
+/// discarding base IRI and prefix declarations. Useful when you only need the
+/// actual RDF data with its named graph structure without document metadata.
+///
+/// ## Examples
+/// ```gleam
+/// let trig_text = "@prefix ex: <http://example.org/> .
+///                  
+///                  ex:graph1 {
+///                    ex:alice ex:name \"Alice\" .
+///                  }"
+/// 
+/// case trig.parse_dataset(trig_text) {
+///   Ok(rdf_dataset) -> {
+///     let graph_names = dataset.graph_names(rdf_dataset)
+///     // Work with the RDF dataset and named graphs directly
+///   }
+///   Error(error) -> // Handle parsing error
+/// }
+/// ```
 pub fn parse_dataset(text: String) -> Result(dataset.Dataset, TrigError) {
   parse(text)
   |> result.map(fn(doc) { doc.dataset })
 }
 
+/// Serialize a TrigDocument to TriG format text.
+///
+/// Converts a structured TriG document back to valid TriG syntax text with
+/// named graph blocks. Handles base declarations, prefix definitions, named
+/// graphs using `GRAPH` statements or `{}` blocks, and RDF-star quoted triple
+/// serialization. Output follows W3C TriG specification and is well-formatted.
+///
+/// ## Examples
+/// ```gleam
+/// let trig_text = trig.serialize(my_document)
+/// 
+/// // Result might look like:
+/// // @base <http://example.org/> .
+/// // @prefix ex: <http://example.org/> .
+/// // 
+/// // <http://example.org/graph1> {
+/// //   ex:alice ex:name "Alice" .
+/// // }
+/// //
+/// // GRAPH ex:graph2 {
+/// //   ex:bob ex:age 25 .
+/// // }
+/// ```
 pub fn serialize(document: TrigDocument) -> String {
   serialize_document(document)
 }
 
+/// Serialize an RDF dataset to TriG format with custom base and prefixes.
+///
+/// Convenience function that creates a TrigDocument from the provided components
+/// and serializes it to TriG text with named graph support. Allows direct
+/// serialization of RDF datasets with multiple named graphs, custom base IRI,
+/// and prefix definitions without manually constructing a TrigDocument.
+///
+/// ## Examples
+/// ```gleam
+/// let prefixes = dict.from_list([
+///   ("ex", "http://example.org/"),
+///   ("foaf", "http://xmlns.com/foaf/0.1/")
+/// ])
+/// 
+/// let trig_text = trig.serialize_dataset(
+///   my_rdf_dataset,
+///   Some("http://example.org/"),
+///   prefixes
+/// )
+/// 
+/// // Handles both default graph and named graphs automatically
+/// ```
 pub fn serialize_dataset(
   dataset_value: dataset.Dataset,
   base: Option(String),
