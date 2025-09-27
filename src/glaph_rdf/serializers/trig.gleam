@@ -175,6 +175,7 @@ fn serialize_subject(
       let term.BlankNode(identifier) = node
       "_:" <> identifier
     }
+    term.SubjectTriple(triple) -> serialize_triple_term(triple, prefixes)
   }
 }
 
@@ -200,7 +201,19 @@ fn serialize_object(
       "_:" <> identifier
     }
     term.ObjectLiteral(literal) -> serialize_literal(literal, prefixes)
+    term.ObjectTriple(triple) -> serialize_triple_term(triple, prefixes)
   }
+}
+
+fn serialize_triple_term(
+  triple_term: term.TripleTerm,
+  prefixes: dict.Dict(String, String),
+) -> String {
+  let term.TripleTerm(subject, predicate, object) = triple_term
+  let subj_str = serialize_subject(subject, prefixes)
+  let pred_str = serialize_predicate(predicate, prefixes)
+  let obj_str = serialize_object(object, prefixes)
+  "<<" <> subj_str <> " " <> pred_str <> " " <> obj_str <> ">>"
 }
 
 fn serialize_named_node(

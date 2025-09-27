@@ -6,8 +6,8 @@ import gleam/string
 import gleam/uri
 
 const ascii_letters = [
-  "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
-  "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+  "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p",
+  "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
 ]
 
 const irregular_language_tags = [
@@ -72,23 +72,31 @@ pub type Literal {
   TypedLiteral(value: String, datatype: NamedNode)
 }
 
+pub type TripleTerm {
+  TripleTerm(subject: Subject, predicate: Predicate, object: Object)
+}
+
 pub type Term {
   NamedTerm(node: NamedNode)
   BlankTerm(node: BlankNode)
   LiteralTerm(literal: Literal)
+  QuotedTripleTerm(triple: TripleTerm)
 }
 
 pub type Subject {
   SubjectNamed(node: NamedNode)
   SubjectBlank(node: BlankNode)
+  SubjectTriple(triple: TripleTerm)
 }
 
-pub type Predicate = NamedNode
+pub type Predicate =
+  NamedNode
 
 pub type Object {
   ObjectNamed(node: NamedNode)
   ObjectBlank(node: BlankNode)
   ObjectLiteral(literal: Literal)
+  ObjectTriple(triple: TripleTerm)
 }
 
 pub type GraphName {
@@ -139,10 +147,31 @@ pub fn typed_literal(value: String, datatype: NamedNode) -> Literal {
   TypedLiteral(value, datatype)
 }
 
+pub fn triple_term(
+  subject: Subject,
+  predicate: Predicate,
+  object: Object,
+) -> TripleTerm {
+  TripleTerm(subject, predicate, object)
+}
+
+pub fn unsafe_triple_term(
+  subject_iri: String,
+  predicate_iri: String,
+  object_iri: String,
+) -> TripleTerm {
+  TripleTerm(
+    SubjectNamed(unsafe_named_node(subject_iri)),
+    unsafe_named_node(predicate_iri),
+    ObjectNamed(unsafe_named_node(object_iri)),
+  )
+}
+
 pub fn term_from_subject(subject: Subject) -> Term {
   case subject {
     SubjectNamed(node) -> NamedTerm(node)
     SubjectBlank(node) -> BlankTerm(node)
+    SubjectTriple(triple) -> QuotedTripleTerm(triple)
   }
 }
 
@@ -151,6 +180,7 @@ pub fn term_from_object(object: Object) -> Term {
     ObjectNamed(node) -> NamedTerm(node)
     ObjectBlank(node) -> BlankTerm(node)
     ObjectLiteral(literal) -> LiteralTerm(literal)
+    ObjectTriple(triple) -> QuotedTripleTerm(triple)
   }
 }
 
@@ -159,6 +189,7 @@ pub fn subject_from_term(term: Term) -> Result(Subject, TermError) {
     NamedTerm(node) -> Ok(SubjectNamed(node))
     BlankTerm(node) -> Ok(SubjectBlank(node))
     LiteralTerm(_) -> Error(InvalidSubjectTerm)
+    QuotedTripleTerm(triple) -> Ok(SubjectTriple(triple))
   }
 }
 
@@ -167,6 +198,7 @@ pub fn object_from_term(term: Term) -> Object {
     NamedTerm(node) -> ObjectNamed(node)
     BlankTerm(node) -> ObjectBlank(node)
     LiteralTerm(literal) -> ObjectLiteral(literal)
+    QuotedTripleTerm(triple) -> ObjectTriple(triple)
   }
 }
 
@@ -175,6 +207,7 @@ pub fn graph_name_from_term(term: Term) -> Result(GraphName, TermError) {
     NamedTerm(node) -> Ok(NamedGraph(node))
     BlankTerm(node) -> Ok(BlankGraph(node))
     LiteralTerm(_) -> Error(InvalidGraphNameTerm)
+    QuotedTripleTerm(_) -> Error(InvalidGraphNameTerm)
   }
 }
 
@@ -208,7 +241,7 @@ fn decode_iri_loop(
 ) -> Result(String, TermError) {
   case graphemes {
     [] -> Ok(string.concat(list.reverse(acc)))
-    ["%", .._] ->
+    ["%", ..] ->
       case decode_percent_sequence(graphemes) {
         Ok(#(segment, rest)) ->
           decode_iri_loop(rest, [segment, ..acc], original)
@@ -264,8 +297,7 @@ fn take_percent_encoded(
 fn validate_iri(value: String) -> Bool {
   case string.split_once(value, ":") {
     Ok(#(scheme, _rest)) ->
-      is_valid_scheme(scheme)
-        && result.is_ok(parse_encoded_iri(value))
+      is_valid_scheme(scheme) && result.is_ok(parse_encoded_iri(value))
 
     Error(_) -> False
   }
@@ -276,9 +308,13 @@ fn is_valid_scheme(scheme: String) -> Bool {
     [] -> False
     [first, ..rest] ->
       is_ascii_letter(first)
-        && list.all(rest, fn(char) {
-          is_ascii_letter(char) || is_digit(char) || char == "+" || char == "-" || char == "."
-        })
+      && list.all(rest, fn(char) {
+        is_ascii_letter(char)
+        || is_digit(char)
+        || char == "+"
+        || char == "-"
+        || char == "."
+      })
   }
 }
 
@@ -342,8 +378,8 @@ fn is_valid_blank_node_identifier(identifier: String) -> Bool {
     [] -> False
     [first, ..rest] ->
       is_valid_blank_head(first)
-        && is_valid_blank_body(first)
-        && list.all(rest, fn(char) { is_valid_blank_body(char) })
+      && is_valid_blank_body(first)
+      && list.all(rest, fn(char) { is_valid_blank_body(char) })
   }
 }
 
@@ -420,11 +456,12 @@ fn build_canonical_langtag(subtags: List(String)) -> Result(String, Nil) {
         True -> {
           let lang_len = string.length(language)
           let canonical_language = string.lowercase(language)
-          let #(extlangs, after_extlangs) =
-            case lang_len >= 2 && lang_len <= 3 {
-              True -> extract_extlangs(rest)
-              False -> #([], rest)
-            }
+          let #(extlangs, after_extlangs) = case
+            lang_len >= 2 && lang_len <= 3
+          {
+            True -> extract_extlangs(rest)
+            False -> #([], rest)
+          }
           let #(script, after_script) = extract_script(after_extlangs)
           let #(region, after_region) = extract_region(after_script)
           let #(variants, after_variants) = extract_variants(after_region)
@@ -433,8 +470,8 @@ fn build_canonical_langtag(subtags: List(String)) -> Result(String, Nil) {
               case extract_privateuse(after_extensions) {
                 Ok(#(privateuse, remainder)) ->
                   case remainder {
-                    [] -> Ok(
-                      assemble_canonical_language_tag(
+                    [] ->
+                      Ok(assemble_canonical_language_tag(
                         canonical_language,
                         extlangs,
                         script,
@@ -442,8 +479,7 @@ fn build_canonical_langtag(subtags: List(String)) -> Result(String, Nil) {
                         variants,
                         extensions,
                         privateuse,
-                      ),
-                    )
+                      ))
                     _ -> Error(Nil)
                   }
                 Error(_) -> Error(Nil)
@@ -467,31 +503,27 @@ fn assemble_canonical_language_tag(
   privateuse: Option(List(String)),
 ) -> String {
   let base = list.append([language], list.map(extlangs, string.lowercase))
-  let base =
-    case script {
-      Some(value) -> list.append(base, [canonical_script(value)])
-      None -> base
-    }
-  let base =
-    case region {
-      Some(value) -> list.append(base, [canonical_region(value)])
-      None -> base
-    }
+  let base = case script {
+    Some(value) -> list.append(base, [canonical_script(value)])
+    None -> base
+  }
+  let base = case region {
+    Some(value) -> list.append(base, [canonical_region(value)])
+    None -> base
+  }
   let base = list.append(base, list.map(variants, string.lowercase))
   let extension_parts =
     extensions
     |> list.map(canonical_extension)
     |> list.flatten
   let base = list.append(base, extension_parts)
-  let base =
-    case privateuse {
-      Some(values) -> {
-        let private_parts =
-          list.append(["x"], list.map(values, string.lowercase))
-        list.append(base, private_parts)
-      }
-      None -> base
+  let base = case privateuse {
+    Some(values) -> {
+      let private_parts = list.append(["x"], list.map(values, string.lowercase))
+      list.append(base, private_parts)
     }
+    None -> base
+  }
   string.join(base, "-")
 }
 
@@ -515,9 +547,11 @@ fn extract_extlangs_loop(
 ) -> #(List(String), List(String)) {
   case subtags {
     [candidate, ..rest] ->
-      case list.length(acc) < 3
+      case
+        list.length(acc) < 3
         && string.length(candidate) == 3
-        && is_alpha_string(candidate) {
+        && is_alpha_string(candidate)
+      {
         True -> extract_extlangs_loop(rest, [candidate, ..acc])
         False -> #(list.reverse(acc), subtags)
       }
@@ -590,7 +624,10 @@ fn extract_extensions_loop(
         True ->
           case extract_extension_subtags(rest, []) {
             Ok(#(subtags_list, remainder)) ->
-              extract_extensions_loop(remainder, [[singleton, ..subtags_list], ..acc])
+              extract_extensions_loop(remainder, [
+                [singleton, ..subtags_list],
+                ..acc
+              ])
             Error(_) -> Error(Nil)
           }
         False -> Ok(#(list.reverse(acc), subtags))
@@ -655,8 +692,10 @@ fn canonical_region(region: String) -> String {
 
 fn canonical_extension(extension: List(String)) -> List(String) {
   case extension {
-    [singleton, ..rest] ->
-      [string.lowercase(singleton), ..list.map(rest, string.lowercase)]
+    [singleton, ..rest] -> [
+      string.lowercase(singleton),
+      ..list.map(rest, string.lowercase)
+    ]
     [] -> []
   }
 }
@@ -682,7 +721,8 @@ fn is_variant_subtag(value: String) -> Bool {
     4 ->
       case string.to_graphemes(value) {
         [first, ..rest] ->
-          is_digit(first) && list.all(rest, fn(char) { is_ascii_letter(char) || is_digit(char) })
+          is_digit(first)
+          && list.all(rest, fn(char) { is_ascii_letter(char) || is_digit(char) })
         [] -> False
       }
     _ -> False
@@ -691,8 +731,7 @@ fn is_variant_subtag(value: String) -> Bool {
 
 fn is_extension_singleton(value: String) -> Bool {
   case string.to_graphemes(value) {
-    [single] ->
-      is_alphanum_string(single) && single != "x"
+    [single] -> is_alphanum_string(single) && single != "x"
     _ -> False
   }
 }
