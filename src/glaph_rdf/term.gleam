@@ -46,65 +46,148 @@ fn grandfathered_language_tags() -> List(String) {
   list.flatten([irregular_language_tags, regular_language_tags])
 }
 
+/// Errors that can occur when creating or validating RDF terms.
 pub type TermError {
+  /// The provided string is not a valid IRI according to RFC 3987.
   InvalidIri(String)
+  /// The provided string is not a valid blank node identifier.
   InvalidBlankNodeIdentifier(String)
+  /// The provided string is not a valid BCP 47 language tag.
   InvalidLanguageTag(String)
+  /// A literal cannot be used as a subject in RDF.
   InvalidSubjectTerm
+  /// A literal or quoted triple cannot be used as a graph name.
   InvalidGraphNameTerm
 }
 
+/// An RDF named node (IRI reference) that identifies a resource.
+/// 
+/// Named nodes must be valid IRIs according to RFC 3987. They are used to 
+/// identify resources, properties, classes, and other entities in RDF data.
 pub type NamedNode {
   NamedNode(value: String)
 }
 
+/// An RDF blank node representing an unnamed resource.
+///
+/// Blank nodes have local identifiers that are unique within a graph but
+/// have no global meaning. They represent existential quantification.
 pub type BlankNode {
   BlankNode(identifier: String)
 }
 
+/// A BCP 47 language tag for language-tagged literals.
+///
+/// Language tags follow the BCP 47 specification and are canonicalized
+/// with proper casing (e.g., "en-US", "zh-Hant-TW").
 pub type LanguageTag {
   LanguageTag(value: String)
 }
 
+/// An RDF literal representing a value with optional language or datatype.
+///
+/// Literals can be:
+/// - Simple: plain string values
+/// - Language-tagged: strings with BCP 47 language tags  
+/// - Typed: values with explicit XML Schema datatypes
 pub type Literal {
+  /// A simple literal with just a string value.
   SimpleLiteral(value: String)
+  /// A literal with a string value and BCP 47 language tag.
   LanguageTaggedLiteral(value: String, tag: LanguageTag)
+  /// A literal with a string value and explicit datatype IRI.
   TypedLiteral(value: String, datatype: NamedNode)
 }
 
+/// An RDF-star quoted triple that can be used as a subject or object.
+///
+/// Triple terms enable making statements about statements (reification).
+/// They are serialized using << >> syntax in RDF-star formats.
+/// 
+/// ## Example
+/// ```gleam
+/// let quoted = triple_term(
+///   SubjectNamed(unsafe_named_node("http://example.org/alice")),
+///   unsafe_named_node("http://xmlns.com/foaf/0.1/name"), 
+///   ObjectLiteral(simple_literal("Alice"))
+/// )
+/// // Represents: <<ex:alice foaf:name "Alice">>
+/// ```
 pub type TripleTerm {
   TripleTerm(subject: Subject, predicate: Predicate, object: Object)
 }
 
+/// A general RDF term that can be a named node, blank node, literal, or quoted triple.
+///
+/// This is the most general type that encompasses all possible RDF terms
+/// including RDF-star quoted triples.
 pub type Term {
+  /// A named node (IRI reference).
   NamedTerm(node: NamedNode)
+  /// A blank node with local identifier.
   BlankTerm(node: BlankNode)
+  /// A literal value (simple, language-tagged, or typed).
   LiteralTerm(literal: Literal)
+  /// An RDF-star quoted triple term.
   QuotedTripleTerm(triple: TripleTerm)
 }
 
+/// The subject position of an RDF triple.
+///
+/// Subjects can be named nodes, blank nodes, or RDF-star quoted triples.
+/// Literals cannot be subjects in RDF.
 pub type Subject {
+  /// A named node subject.
   SubjectNamed(node: NamedNode)
+  /// A blank node subject.
   SubjectBlank(node: BlankNode)
+  /// An RDF-star quoted triple as subject.
   SubjectTriple(triple: TripleTerm)
 }
 
+/// The predicate position of an RDF triple.
+///
+/// Predicates must always be named nodes (IRIs) in RDF.
 pub type Predicate =
   NamedNode
 
+/// The object position of an RDF triple.
+///
+/// Objects can be named nodes, blank nodes, literals, or RDF-star quoted triples.
 pub type Object {
+  /// A named node object.
   ObjectNamed(node: NamedNode)
+  /// A blank node object.
   ObjectBlank(node: BlankNode)
+  /// A literal object.
   ObjectLiteral(literal: Literal)
+  /// An RDF-star quoted triple as object.
   ObjectTriple(triple: TripleTerm)
 }
 
+/// The name/identifier of an RDF graph in a dataset.
+///
+/// Graphs can be the default graph (unnamed) or named graphs identified
+/// by IRIs or blank nodes.
 pub type GraphName {
+  /// The default (unnamed) graph in a dataset.
   DefaultGraph
+  /// A named graph identified by an IRI.
   NamedGraph(node: NamedNode)
+  /// A named graph identified by a blank node.
   BlankGraph(node: BlankNode)
 }
 
+/// Create a named node from an IRI string with validation.
+///
+/// Validates that the provided string is a well-formed IRI according to RFC 3987
+/// and RDF 1.2 restrictions. Returns an error if the IRI is invalid.
+///
+/// ## Examples
+/// ```gleam
+/// named_node("http://example.org/alice")  // Ok(NamedNode(...))
+/// named_node("not-an-iri")                // Error(InvalidIri(...))
+/// ```
 pub fn named_node(value: String) -> Result(NamedNode, TermError) {
   case validate_iri(value) {
     True -> Ok(NamedNode(value))
@@ -112,10 +195,32 @@ pub fn named_node(value: String) -> Result(NamedNode, TermError) {
   }
 }
 
+/// Create a named node from an IRI string without validation.
+///
+/// **Warning**: This function bypasses IRI validation. Only use when you are
+/// certain the IRI is valid to avoid creating invalid RDF. Prefer `named_node/1`
+/// for safe construction with validation.
+///
+/// ## Examples
+/// ```gleam
+/// unsafe_named_node("http://example.org/alice")  // NamedNode(...)
+/// ```
 pub fn unsafe_named_node(value: String) -> NamedNode {
   NamedNode(value)
 }
 
+/// Create a blank node with validation of the identifier format.
+///
+/// Validates that the identifier follows RDF blank node identifier rules:
+/// - Starts with an underscore or letter
+/// - Followed by zero or more letters, digits, hyphens, or underscores
+///
+/// ## Examples
+/// ```gleam
+/// blank_node("n1")      // Ok(BlankNode("n1"))
+/// blank_node("_:b42")   // Ok(BlankNode("_:b42"))
+/// blank_node("123")     // Error(InvalidBlankNodeIdentifier("123"))
+/// ```
 pub fn blank_node(identifier: String) -> Result(BlankNode, TermError) {
   case is_valid_blank_node_identifier(identifier) {
     True -> Ok(BlankNode(identifier))
@@ -123,10 +228,32 @@ pub fn blank_node(identifier: String) -> Result(BlankNode, TermError) {
   }
 }
 
+/// Create a blank node without validation of the identifier.
+///
+/// **Warning**: This function bypasses identifier validation. Only use when you are
+/// certain the identifier is valid to avoid creating invalid RDF. Prefer the
+/// validated `blank_node/1` function for safe construction.
+///
+/// ## Examples
+/// ```gleam
+/// unsafe_blank_node("n1")  // BlankNode("n1")
+/// ```
 pub fn unsafe_blank_node(identifier: String) -> BlankNode {
   BlankNode(identifier)
 }
 
+/// Create a language tag from a BCP 47 language tag string with validation.
+///
+/// Validates and normalizes the language tag according to BCP 47 and RDF 1.2 rules.
+/// Converts to canonical lowercase form and validates structure including language,
+/// script, region, variants, and extensions.
+///
+/// ## Examples
+/// ```gleam
+/// language_tag("en-US")     // Ok(LanguageTag("en-us"))
+/// language_tag("zh-Hant")   // Ok(LanguageTag("zh-hant"))  
+/// language_tag("invalid")   // Error(InvalidLanguageTag("invalid"))
+/// ```
 pub fn language_tag(value: String) -> Result(LanguageTag, TermError) {
   let lower = string.lowercase(value)
   case canonical_language_tag(lower) {
@@ -135,18 +262,63 @@ pub fn language_tag(value: String) -> Result(LanguageTag, TermError) {
   }
 }
 
+/// Create a simple string literal without language tag or datatype.
+///
+/// Simple literals represent plain text values in RDF. They are equivalent
+/// to typed literals with the `xsd:string` datatype.
+///
+/// ## Examples
+/// ```gleam
+/// simple_literal("Hello World")  // SimpleLiteral("Hello World")
+/// simple_literal("")             // SimpleLiteral("")
+/// ```
 pub fn simple_literal(value: String) -> Literal {
   SimpleLiteral(value)
 }
 
+/// Create a language-tagged string literal.
+///
+/// Language-tagged literals associate natural language text with a specific
+/// language using BCP 47 language tags. Useful for internationalization
+/// and multilingual content.
+///
+/// ## Examples
+/// ```gleam
+/// language_literal("Hello", LanguageTag("en"))      // LanguageTaggedLiteral(...)
+/// language_literal("Bonjour", LanguageTag("fr"))    // LanguageTaggedLiteral(...)
+/// ```
 pub fn language_literal(value: String, tag: LanguageTag) -> Literal {
   LanguageTaggedLiteral(value, tag)
 }
 
+/// Create a typed literal with a specific datatype.
+///
+/// Typed literals associate a string value with an IRI that identifies
+/// the datatype. Common datatypes include XSD types like integer, boolean,
+/// dateTime, etc.
+///
+/// ## Examples
+/// ```gleam
+/// typed_literal("42", NamedNode("http://www.w3.org/2001/XMLSchema#int"))
+/// typed_literal("true", NamedNode("http://www.w3.org/2001/XMLSchema#boolean"))
+/// ```
 pub fn typed_literal(value: String, datatype: NamedNode) -> Literal {
   TypedLiteral(value, datatype)
 }
 
+/// Create a quoted triple term for RDF-star from validated RDF terms.
+///
+/// Creates a quoted triple (also called a reified triple) that can be used
+/// as a subject or object in other triples. This enables metadata about
+/// statements in RDF-star.
+///
+/// ## Examples
+/// ```gleam
+/// let alice = SubjectNamed(NamedNode("http://example.org/alice"))
+/// let knows = NamedNode("http://xmlns.com/foaf/0.1/knows")  
+/// let bob = ObjectNamed(NamedNode("http://example.org/bob"))
+/// triple_term(alice, knows, bob)  // TripleTerm(alice knows bob)
+/// ```
 pub fn triple_term(
   subject: Subject,
   predicate: Predicate,
@@ -155,6 +327,20 @@ pub fn triple_term(
   TripleTerm(subject, predicate, object)
 }
 
+/// Create a quoted triple term from IRI strings without validation.
+///
+/// **Warning**: This function bypasses IRI validation for all three terms.
+/// Only use when you are certain all IRIs are valid. Prefer constructing
+/// with validated terms and `triple_term/3` for safe construction.
+///
+/// ## Examples
+/// ```gleam
+/// unsafe_triple_term(
+///   "http://example.org/alice",
+///   "http://xmlns.com/foaf/0.1/knows", 
+///   "http://example.org/bob"
+/// )  // TripleTerm with named node terms
+/// ```
 pub fn unsafe_triple_term(
   subject_iri: String,
   predicate_iri: String,
@@ -167,6 +353,19 @@ pub fn unsafe_triple_term(
   )
 }
 
+/// Convert a subject term to a general term.
+///
+/// Converts RDF subject positions (named nodes, blank nodes, or quoted triples
+/// in RDF-star) to the general Term type for uniform handling.
+///
+/// ## Examples
+/// ```gleam
+/// term_from_subject(SubjectNamed(NamedNode("http://example.org/alice")))
+/// // -> NamedTerm(NamedNode("http://example.org/alice"))
+/// 
+/// term_from_subject(SubjectBlank(BlankNode("b1")))
+/// // -> BlankTerm(BlankNode("b1"))
+/// ```
 pub fn term_from_subject(subject: Subject) -> Term {
   case subject {
     SubjectNamed(node) -> NamedTerm(node)
@@ -175,6 +374,19 @@ pub fn term_from_subject(subject: Subject) -> Term {
   }
 }
 
+/// Convert an object term to a general term.
+///
+/// Converts RDF object positions (named nodes, blank nodes, literals, or 
+/// quoted triples in RDF-star) to the general Term type for uniform handling.
+///
+/// ## Examples
+/// ```gleam
+/// term_from_object(ObjectLiteral(SimpleLiteral("Hello")))
+/// // -> LiteralTerm(SimpleLiteral("Hello"))
+/// 
+/// term_from_object(ObjectNamed(NamedNode("http://example.org/bob")))
+/// // -> NamedTerm(NamedNode("http://example.org/bob"))
+/// ```
 pub fn term_from_object(object: Object) -> Term {
   case object {
     ObjectNamed(node) -> NamedTerm(node)
@@ -184,6 +396,20 @@ pub fn term_from_object(object: Object) -> Term {
   }
 }
 
+/// Convert a general term to a subject term with validation.
+///
+/// Converts a general Term to a Subject, ensuring it contains only terms
+/// that are valid in subject position (named nodes, blank nodes, or quoted
+/// triples in RDF-star). Literals cannot be subjects in RDF.
+///
+/// ## Examples
+/// ```gleam
+/// subject_from_term(NamedTerm(NamedNode("http://example.org/alice")))
+/// // -> Ok(SubjectNamed(...))
+/// 
+/// subject_from_term(LiteralTerm(SimpleLiteral("Hello")))
+/// // -> Error(InvalidSubjectTerm)
+/// ```
 pub fn subject_from_term(term: Term) -> Result(Subject, TermError) {
   case term {
     NamedTerm(node) -> Ok(SubjectNamed(node))
@@ -193,6 +419,20 @@ pub fn subject_from_term(term: Term) -> Result(Subject, TermError) {
   }
 }
 
+/// Convert a general term to an object term.
+///
+/// Converts any Term to an Object. All RDF term types can appear in object
+/// position, including named nodes, blank nodes, literals, and quoted triples
+/// in RDF-star.
+///
+/// ## Examples
+/// ```gleam
+/// object_from_term(LiteralTerm(SimpleLiteral("Hello")))
+/// // -> ObjectLiteral(SimpleLiteral("Hello"))
+/// 
+/// object_from_term(NamedTerm(NamedNode("http://example.org/bob")))  
+/// // -> ObjectNamed(NamedNode("http://example.org/bob"))
+/// ```
 pub fn object_from_term(term: Term) -> Object {
   case term {
     NamedTerm(node) -> ObjectNamed(node)
@@ -202,6 +442,20 @@ pub fn object_from_term(term: Term) -> Object {
   }
 }
 
+/// Convert a general term to a graph name with validation.
+///
+/// Converts a Term to a GraphName for use in RDF datasets. Only named nodes
+/// and blank nodes can be graph names. Literals and quoted triples cannot
+/// identify graphs in RDF.
+///
+/// ## Examples
+/// ```gleam
+/// graph_name_from_term(NamedTerm(NamedNode("http://example.org/graph1")))
+/// // -> Ok(NamedGraph(...))
+/// 
+/// graph_name_from_term(LiteralTerm(SimpleLiteral("invalid")))
+/// // -> Error(InvalidGraphNameTerm)
+/// ```
 pub fn graph_name_from_term(term: Term) -> Result(GraphName, TermError) {
   case term {
     NamedTerm(node) -> Ok(NamedGraph(node))
@@ -211,25 +465,77 @@ pub fn graph_name_from_term(term: Term) -> Result(GraphName, TermError) {
   }
 }
 
+/// Parse an IRI string into a URI structure with validation.
+///
+/// Converts an IRI (Internationalized Resource Identifier) string into
+/// a structured URI representation, handling percent-encoding and validation
+/// according to RFC 3987.
+///
+/// ## Examples
+/// ```gleam
+/// iri_to_uri("http://example.org/path")  // Ok(Uri(...))
+/// iri_to_uri("not-valid-iri")           // Error(InvalidIri(...))
+/// ```
 pub fn iri_to_uri(value: String) -> Result(uri.Uri, TermError) {
   parse_encoded_iri(value)
 }
 
+/// Convert a URI structure back to an IRI string with decoding.
+///
+/// Converts a structured URI back to an IRI string representation,
+/// handling percent-decoding of internationalized characters according
+/// to RFC 3987 requirements.
+///
+/// ## Examples
+/// ```gleam
+/// uri_to_iri(some_uri)  // Ok("http://example.org/path")
+/// ```
 pub fn uri_to_iri(uri_value: uri.Uri) -> Result(String, TermError) {
   uri.to_string(uri_value)
   |> decode_iri
 }
 
+/// Convert a named node to a URI structure.
+///
+/// Extracts the IRI string from a named node and parses it into a structured
+/// URI representation for manipulation or analysis.
+///
+/// ## Examples
+/// ```gleam
+/// let node = NamedNode("http://example.org/alice")
+/// named_node_to_uri(node)  // Ok(Uri(...))
+/// ```
 pub fn named_node_to_uri(node: NamedNode) -> Result(uri.Uri, TermError) {
   let NamedNode(value) = node
   iri_to_uri(value)
 }
 
+/// Create a named node from a URI structure with validation.
+///
+/// Converts a structured URI to an IRI string and creates a validated
+/// named node. The URI is converted to string form and then validated
+/// according to RDF requirements.
+///
+/// ## Examples
+/// ```gleam
+/// named_node_from_uri(some_valid_uri)  // Ok(NamedNode(...))
+/// ```
 pub fn named_node_from_uri(uri_value: uri.Uri) -> Result(NamedNode, TermError) {
   uri_to_iri(uri_value)
   |> result.try(named_node)
 }
 
+/// Decode percent-encoded characters in an IRI string.
+///
+/// Processes an IRI string and decodes percent-encoded sequences (like %20 for space)
+/// back to their original Unicode characters. Validates that the encoding is
+/// well-formed according to RFC 3987.
+///
+/// ## Examples
+/// ```gleam
+/// decode_iri("http://example.org/hello%20world")  // Ok("http://example.org/hello world")
+/// decode_iri("invalid%ZZ")                        // Error(InvalidIriEncoding(...))
+/// ```
 pub fn decode_iri(value: String) -> Result(String, TermError) {
   decode_iri_loop(string.to_graphemes(value), [], value)
 }
