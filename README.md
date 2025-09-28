@@ -4,6 +4,10 @@ A comprehensive RDF 1.2 library for Gleam with built-in Turtle, TriG, N-Triples 
 The library provides validated term types (IRIs, blank nodes, canonical BCP&nbsp;47 language tags),
 set-like graph and dataset collections, and full-featured RDF serializers with parsing support.
 
+## What is 'glaph'?
+
+Gleam <3 Graph
+
 ## Key features
 
 - **RFC 3987 IRI validation** – reject malformed IRIs and percent-encode
@@ -250,7 +254,7 @@ case turtle.serialize_graph_to_file(my_graph, None, prefixes, "output/data.ttl")
 - `parse_file()` / `parse_graph_file()` / `parse_dataset_file()` - Read from files
 - `serialize_to_file()` / `serialize_graph_to_file()` / `serialize_dataset_to_file()` - Write to files
 
-For detailed documentation and examples, see [FILE_IO.md](FILE_IO.md).
+For detailed documentation and examples, see [FILE_IO.md](docs/FILE_IO.md).
 
 ### Testing Coverage
 
@@ -337,7 +341,7 @@ dataset.isomorphic(dataset1, dataset2)  // -> True
 - **Test Assertions** – compare expected vs actual results regardless of blank node naming
 - **Data Deduplication** – identify semantically identical RDF structures
 
-For detailed documentation and examples, see [ISOMORPHISM.md](ISOMORPHISM.md).
+For detailed documentation and examples, see [ISOMORPHISM.md](docs/ISOMORPHISM.md).
 
 ## Contributing
 
@@ -349,4 +353,8 @@ Issues and pull requests are welcome! If you spot gaps in RDF 1.2 coverage or
 have ideas for higher-level APIs, please open a discussion.
 
 ## License
+
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
+Copyright 2025 Lars Wilhelmsen &lt;lars@sral.org&gt;
 
