@@ -1,6 +1,6 @@
 # glaph_rdf
 
-A comprehensive RDF 1.2 library for Gleam with built-in Turtle and TriG serialization.
+A comprehensive RDF 1.2 library for Gleam with built-in Turtle, TriG, N-Triples and N-Quads serialization.
 The library provides validated term types (IRIs, blank nodes, canonical BCP&nbsp;47 language tags),
 set-like graph and dataset collections, and full-featured RDF serializers with parsing support.
 

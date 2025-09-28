@@ -1,8 +1,8 @@
-import gleam/uri.{type Uri}
 import glaph_rdf/dataset as dataset_mod
 import glaph_rdf/graph as graph_mod
 import glaph_rdf/statement as statement_mod
 import glaph_rdf/term as term_mod
+import gleam/uri.{type Uri}
 
 /// The `glaph_rdf` module exposes a serialization-agnostic RDF 1.2 data model.
 ///
@@ -16,23 +16,47 @@ import glaph_rdf/term as term_mod
 /// Typical projects use this module exclusively, while the underlying
 /// implementation details live in `glaph_rdf/term`, `glaph_rdf/statement`,
 /// `glaph_rdf/graph`, and `glaph_rdf/dataset`.
+pub type TermError =
+  term_mod.TermError
 
-pub type TermError = term_mod.TermError
-pub type NamedNode = term_mod.NamedNode
-pub type BlankNode = term_mod.BlankNode
-pub type LanguageTag = term_mod.LanguageTag
-pub type Literal = term_mod.Literal
-pub type Term = term_mod.Term
-pub type Subject = term_mod.Subject
-pub type Predicate = term_mod.Predicate
-pub type Object = term_mod.Object
-pub type GraphName = term_mod.GraphName
+pub type NamedNode =
+  term_mod.NamedNode
 
-pub type Triple = statement_mod.Triple
-pub type Quad = statement_mod.Quad
+pub type BlankNode =
+  term_mod.BlankNode
 
-pub type Graph = graph_mod.Graph
-pub type Dataset = dataset_mod.Dataset
+pub type LanguageTag =
+  term_mod.LanguageTag
+
+pub type Literal =
+  term_mod.Literal
+
+pub type Term =
+  term_mod.Term
+
+pub type Subject =
+  term_mod.Subject
+
+pub type Predicate =
+  term_mod.Predicate
+
+pub type Object =
+  term_mod.Object
+
+pub type GraphName =
+  term_mod.GraphName
+
+pub type Triple =
+  statement_mod.Triple
+
+pub type Quad =
+  statement_mod.Quad
+
+pub type Graph =
+  graph_mod.Graph
+
+pub type Dataset =
+  dataset_mod.Dataset
 
 /// Create a `NamedNode` from an absolute IRI, validating it against
 /// RFC&nbsp;3987 syntax and RDF 1.2 constraints.
@@ -112,11 +136,7 @@ pub fn graph_name_from_term(term: Term) -> Result(GraphName, TermError) {
 }
 
 /// Build an RDF triple from a subject, predicate, and object.
-pub fn triple(
-  subject: Subject,
-  predicate: Predicate,
-  object: Object,
-) -> Triple {
+pub fn triple(subject: Subject, predicate: Predicate, object: Object) -> Triple {
   statement_mod.triple(subject, predicate, object)
 }
 
