@@ -11,6 +11,8 @@
 //// Supports full RDF-star syntax with quoted triples using `<<( ... )>>` notation
 //// in subject and object positions, following the RDF-star specification extensions.
 
+import file_streams/file_stream
+import file_streams/file_stream_error
 import glaph_rdf/dataset
 import glaph_rdf/statement
 import glaph_rdf/term
@@ -689,4 +691,132 @@ fn escape_string(value: String) -> String {
   |> string.replace("\n", "\\n")
   |> string.replace("\r", "\\r")
   |> string.replace("\t", "\\t")
+}
+
+// Streaming Operations
+
+/// Stream parse N-Quads from a file line by line.
+///
+/// This function reads the file line by line without loading the entire
+/// file into memory, making it suitable for processing very large N-Quads
+/// files. Each line is parsed as it's read and added to the dataset.
+///
+/// ## Examples
+/// ```gleam
+/// case nquads.streaming_parse_file("large_dataset.nq") {
+///   Ok(document) -> {
+///     io.println("Successfully parsed large dataset")
+///   }
+///   Error(file_stream_error.Enoent) -> io.println("File not found")
+///   // ... other file errors
+/// }
+/// ```
+pub fn streaming_parse_file(
+  filename: String,
+) -> Result(NQuadsDocument, file_stream_error.FileStreamError) {
+  use stream <- result.try(file_stream.open_read(filename))
+  let result = streaming_parse_from_stream(stream)
+  // Always try to close the stream
+  let _ = file_stream.close(stream)
+  case result {
+    Ok(document) -> Ok(document)
+    Error(_) -> Error(file_stream_error.Eio)
+    // Generic I/O error for parse failures
+  }
+}
+
+/// Stream serialize N-Quads dataset to a file line by line.
+///
+/// This function writes quads to the file one by one without building
+/// the entire serialized content in memory first, making it suitable for
+/// serializing very large datasets.
+///
+/// ## Examples
+/// ```gleam
+/// let my_dataset = dataset.new()
+///   |> dataset.add(statement.Quad(...))
+///   
+/// case nquads.streaming_serialize_to_file(my_dataset, "output.nq") {
+///   Ok(Nil) -> io.println("Dataset successfully written to file")
+///   Error(file_stream_error.Eacces) -> io.println("Permission denied")
+///   // ... other file errors
+/// }
+/// ```
+pub fn streaming_serialize_to_file(
+  dataset: dataset.Dataset,
+  filename: String,
+) -> Result(Nil, file_stream_error.FileStreamError) {
+  use stream <- result.try(file_stream.open_write(filename))
+  let result = streaming_serialize_dataset_to_stream(dataset, stream)
+  // Always try to close the stream
+  let _ = file_stream.close(stream)
+  result
+}
+
+// Internal streaming helper functions
+
+fn streaming_parse_from_stream(
+  stream: file_stream.FileStream,
+) -> Result(NQuadsDocument, NQuadsError) {
+  let empty_dataset = dataset.new()
+  streaming_parse_lines(stream, empty_dataset, 1)
+}
+
+fn streaming_parse_lines(
+  stream: file_stream.FileStream,
+  acc_dataset: dataset.Dataset,
+  line_number: Int,
+) -> Result(NQuadsDocument, NQuadsError) {
+  case file_stream.read_line(stream) {
+    Ok(line) -> {
+      let trimmed_line = string.trim(line)
+      case trimmed_line {
+        // Skip empty lines and comments
+        "" | "#" <> _ ->
+          streaming_parse_lines(stream, acc_dataset, line_number + 1)
+        _ -> {
+          case parse_line(trimmed_line, line_number) {
+            Ok(quad) -> {
+              let updated_dataset = dataset.add_quad(acc_dataset, quad)
+              streaming_parse_lines(stream, updated_dataset, line_number + 1)
+            }
+            Error(err) -> Error(err)
+          }
+        }
+      }
+    }
+    Error(file_stream_error.Eof) -> {
+      // End of file - return the accumulated dataset
+      Ok(NQuadsDocument(dataset: acc_dataset))
+    }
+    Error(_) -> {
+      Error(NQuadsError("Failed to read line from stream", line_number))
+    }
+  }
+}
+
+fn streaming_serialize_dataset_to_stream(
+  dataset: dataset.Dataset,
+  stream: file_stream.FileStream,
+) -> Result(Nil, file_stream_error.FileStreamError) {
+  let quads_list = dataset.quads
+  streaming_write_quads(quads_list, stream)
+}
+
+fn streaming_write_quads(
+  quads_list: List(statement.Quad),
+  stream: file_stream.FileStream,
+) -> Result(Nil, file_stream_error.FileStreamError) {
+  case quads_list {
+    [] -> Ok(Nil)
+    [quad, ..rest] -> {
+      let statement.Quad(subject: s, predicate: p, object: o, graph: g) = quad
+      let triple = statement.Triple(subject: s, predicate: p, object: o)
+      let line = serialize_quad_to_nquads(triple, g) <> "\n"
+      case file_stream.write_chars(stream, line) {
+        Ok(_) -> streaming_write_quads(rest, stream)
+        Error(err) -> Error(err)
+      }
+    }
+  }
 }

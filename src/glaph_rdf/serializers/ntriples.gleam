@@ -5,9 +5,12 @@
 //// This makes it ideal for large-scale data processing and streaming applications.
 //// Supports RDF-star quoted triples with `<<( ... )>>` syntax.
 
+import file_streams/file_stream
+import file_streams/file_stream_error
 import glaph_rdf/graph
 import glaph_rdf/statement
 import glaph_rdf/term
+
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -808,4 +811,131 @@ fn unescape_iri(iri: String) -> String {
   |> string.replace("\\t", "\t")
   |> string.replace("\\\"", "\"")
   |> string.replace("\\\\", "\\")
+}
+
+// Streaming Operations
+
+/// Stream parse N-Triples from a file line by line.
+///
+/// This function reads the file line by line without loading the entire
+/// file into memory, making it suitable for processing very large N-Triples
+/// files. Each line is parsed as it's read and added to the graph.
+///
+/// ## Examples
+/// ```gleam
+/// case ntriples.streaming_parse_file("large_dataset.nt") {
+///   Ok(document) -> {
+///     io.println("Successfully parsed " <> int.to_string(graph.size(document.graph)) <> " triples")
+///   }
+///   Error(file_stream_error.Enoent) -> io.println("File not found")
+///   Error(file_stream_error.Eacces) -> io.println("Permission denied")
+///   // ... other file errors
+/// }
+/// ```
+pub fn streaming_parse_file(
+  filename: String,
+) -> Result(NTriplesDocument, file_stream_error.FileStreamError) {
+  use stream <- result.try(file_stream.open_read(filename))
+  let result = streaming_parse_from_stream(stream)
+  // Always try to close the stream
+  let _ = file_stream.close(stream)
+  case result {
+    Ok(document) -> Ok(document)
+    Error(_) -> Error(file_stream_error.Eio)
+    // Generic I/O error for parse failures
+  }
+}
+
+/// Stream serialize N-Triples graph to a file line by line.
+///
+/// This function writes triples to the file one by one without building
+/// the entire serialized content in memory first, making it suitable for
+/// serializing very large graphs.
+///
+/// ## Examples
+/// ```gleam
+/// let my_graph = graph.new()
+///   |> graph.add(statement.Triple(...))
+///   
+/// case ntriples.streaming_serialize_to_file(my_graph, "output.nt") {
+///   Ok(Nil) -> io.println("Graph successfully written to file")
+///   Error(file_stream_error.Eacces) -> io.println("Permission denied")
+///   // ... other file errors
+/// }
+/// ```
+pub fn streaming_serialize_to_file(
+  graph: graph.Graph,
+  filename: String,
+) -> Result(Nil, file_stream_error.FileStreamError) {
+  use stream <- result.try(file_stream.open_write(filename))
+  let result = streaming_serialize_graph_to_stream(graph, stream)
+  // Always try to close the stream
+  let _ = file_stream.close(stream)
+  result
+}
+
+// Internal streaming helper functions
+
+fn streaming_parse_from_stream(
+  stream: file_stream.FileStream,
+) -> Result(NTriplesDocument, NTriplesError) {
+  let empty_graph = graph.new()
+  streaming_parse_lines(stream, empty_graph, 1)
+}
+
+fn streaming_parse_lines(
+  stream: file_stream.FileStream,
+  acc_graph: graph.Graph,
+  line_number: Int,
+) -> Result(NTriplesDocument, NTriplesError) {
+  case file_stream.read_line(stream) {
+    Ok(line) -> {
+      let trimmed_line = string.trim(line)
+      case trimmed_line {
+        // Skip empty lines and comments
+        "" | "#" <> _ ->
+          streaming_parse_lines(stream, acc_graph, line_number + 1)
+        _ -> {
+          case parse_line(trimmed_line, line_number) {
+            Ok(triple) -> {
+              let updated_graph = graph.add(acc_graph, triple)
+              streaming_parse_lines(stream, updated_graph, line_number + 1)
+            }
+            Error(err) -> Error(err)
+          }
+        }
+      }
+    }
+    Error(file_stream_error.Eof) -> {
+      // End of file - return the accumulated graph
+      Ok(NTriplesDocument(graph: acc_graph))
+    }
+    Error(_) -> {
+      Error(NTriplesError("Failed to read line from stream", line_number))
+    }
+  }
+}
+
+fn streaming_serialize_graph_to_stream(
+  graph: graph.Graph,
+  stream: file_stream.FileStream,
+) -> Result(Nil, file_stream_error.FileStreamError) {
+  let triples_list = graph.triples
+  streaming_write_triples(triples_list, stream)
+}
+
+fn streaming_write_triples(
+  triples_list: List(statement.Triple),
+  stream: file_stream.FileStream,
+) -> Result(Nil, file_stream_error.FileStreamError) {
+  case triples_list {
+    [] -> Ok(Nil)
+    [triple, ..rest] -> {
+      let line = serialize_triple(triple) <> "\n"
+      case file_stream.write_chars(stream, line) {
+        Ok(_) -> streaming_write_triples(rest, stream)
+        Error(err) -> Error(err)
+      }
+    }
+  }
 }
