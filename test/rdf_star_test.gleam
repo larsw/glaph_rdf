@@ -56,7 +56,7 @@ pub fn create_unsafe_triple_term_test() {
       "http://example.org/alice_name",
     )
 
-  let term.TripleTerm(subject, predicate, object) = triple_term
+  let term.TripleTerm(subject, _predicate, _object) = triple_term
 
   case subject {
     term.SubjectNamed(term.NamedNode(iri)) ->
