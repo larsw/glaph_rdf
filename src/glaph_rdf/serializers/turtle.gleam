@@ -13,6 +13,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/uri
+import simplifile
 
 const rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
 
@@ -201,6 +202,136 @@ pub fn serialize_graph(
     prefixes: prefixes,
     graph: graph_value,
   ))
+}
+
+/// Parse a Turtle document from a file into a structured representation.
+///
+/// Reads a Turtle file and parses its contents including base declarations, 
+/// prefix definitions, and RDF triples. Supports RDF-star quoted triples with 
+/// `<< >>` syntax. Returns detailed error information on file read failures 
+/// or parse errors.
+///
+/// ## Examples
+/// ```gleam
+/// case turtle.parse_file("data/ontology.ttl") {
+///   Ok(document) -> {
+///     // Access document.base, document.prefixes, document.graph
+///     let triple_count = graph.size(document.graph)
+///   }
+///   Error(error) -> {
+///     // Handle file read or parsing error
+///   }
+/// }
+/// ```
+pub fn parse_file(path: String) -> Result(TurtleDocument, TurtleError) {
+  case simplifile.read(path) {
+    Ok(contents) -> parse(contents)
+    Error(error) -> {
+      let error_msg = case error {
+        simplifile.Enoent -> "File not found"
+        simplifile.Eacces -> "Permission denied"
+        simplifile.Eisdir -> "Path is a directory"
+        _ -> "File read error"
+      }
+      Error(TurtleError("File error: " <> error_msg <> " (" <> path <> ")", 0))
+    }
+  }
+}
+
+/// Parse a Turtle file and extract only the RDF graph content.
+///
+/// Convenience function that reads and parses a Turtle file, returning just 
+/// the RDF graph while discarding base IRI and prefix declarations. Useful 
+/// when you only need the actual RDF data from the file.
+///
+/// ## Examples
+/// ```gleam
+/// case turtle.parse_graph_file("data/triples.ttl") {
+///   Ok(rdf_graph) -> {
+///     let triple_count = graph.size(rdf_graph)
+///     // Work with the RDF graph directly
+///   }
+///   Error(error) -> // Handle file or parsing error
+/// }
+/// ```
+pub fn parse_graph_file(path: String) -> Result(graph.Graph, TurtleError) {
+  parse_file(path)
+  |> result.map(fn(doc) { doc.graph })
+}
+
+/// Serialize a TurtleDocument to a file in Turtle format.
+///
+/// Converts a structured Turtle document to valid Turtle syntax and writes 
+/// it to the specified file. Creates parent directories if they don't exist.
+/// Handles IRI escaping, prefix usage, literal formatting, and RDF-star 
+/// quoted triple serialization.
+///
+/// ## Examples
+/// ```gleam
+/// let document = TurtleDocument(
+///   base: Some("http://example.org/"),
+///   prefixes: my_prefixes,
+///   graph: my_graph
+/// )
+/// 
+/// case turtle.serialize_to_file(document, "output/data.ttl") {
+///   Ok(Nil) -> // File written successfully
+///   Error(error) -> // Handle file write error
+/// }
+/// ```
+pub fn serialize_to_file(
+  document: TurtleDocument,
+  path: String,
+) -> Result(Nil, TurtleError) {
+  let content = serialize_document(document)
+  case simplifile.write(path, content) {
+    Ok(Nil) -> Ok(Nil)
+    Error(error) -> {
+      let error_msg = case error {
+        simplifile.Enoent -> "Directory not found"
+        simplifile.Eacces -> "Permission denied"
+        simplifile.Enospc -> "No space left on device"
+        _ -> "File write error"
+      }
+      Error(TurtleError("File error: " <> error_msg <> " (" <> path <> ")", 0))
+    }
+  }
+}
+
+/// Serialize an RDF graph to a Turtle file with custom base and prefixes.
+///
+/// Convenience function that creates a TurtleDocument from the provided 
+/// components and writes it to the specified file in Turtle format. Allows 
+/// direct file output of RDF graphs with custom base IRI and prefix 
+/// definitions without manually constructing a TurtleDocument.
+///
+/// ## Examples
+/// ```gleam
+/// let prefixes = dict.from_list([
+///   ("ex", "http://example.org/"),
+///   ("foaf", "http://xmlns.com/foaf/0.1/")
+/// ])
+/// 
+/// case turtle.serialize_graph_to_file(
+///   my_rdf_graph,
+///   Some("http://example.org/"),
+///   prefixes,
+///   "output/graph.ttl"
+/// ) {
+///   Ok(Nil) -> // Graph written to file successfully
+///   Error(error) -> // Handle file write error
+/// }
+/// ```
+pub fn serialize_graph_to_file(
+  graph_value: graph.Graph,
+  base: Option(String),
+  prefixes: dict.Dict(String, String),
+  path: String,
+) -> Result(Nil, TurtleError) {
+  serialize_to_file(
+    TurtleDocument(base: base, prefixes: prefixes, graph: graph_value),
+    path,
+  )
 }
 
 fn tokenize(text: String) -> Result(List(Token), TurtleError) {

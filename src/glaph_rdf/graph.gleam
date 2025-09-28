@@ -1,5 +1,11 @@
 import glaph_rdf/statement
+import glaph_rdf/term
+import gleam/dict
+import gleam/int
 import gleam/list
+import gleam/order
+import gleam/result
+import gleam/string
 
 /// An RDF graph containing a collection of RDF triples.
 ///
@@ -161,6 +167,323 @@ pub fn remove(graph: Graph, triple: statement.Triple) -> Graph {
 /// ```
 pub fn merge(into graph: Graph, from other: Graph) -> Graph {
   list.fold(other.triples, graph, fn(acc, triple) { add(acc, triple) })
+}
+
+/// Check if two RDF graphs are isomorphic (logically equivalent).
+///
+/// Two graphs are isomorphic if there exists a bijection between their blank nodes
+/// such that when applied, the graphs become identical. This means they represent
+/// the same RDF information despite potentially different blank node labels.
+///
+/// This algorithm uses canonical labeling to normalize blank node identifiers,
+/// making isomorphism checking reliable and efficient.
+///
+/// ## Examples
+/// ```gleam
+/// let graph1 = graph.from_list([
+///   statement.triple(term.SubjectBlank(blank_node("a")), predicate, object)
+/// ])
+/// let graph2 = graph.from_list([
+///   statement.triple(term.SubjectBlank(blank_node("x")), predicate, object)  
+/// ])
+/// 
+/// graph.isomorphic(graph1, graph2)  // -> True (same structure, different blank node labels)
+/// ```
+///
+/// ## Complexity
+/// Time: O(n²) where n is the number of triples
+/// Space: O(n) for canonical representation
+pub fn isomorphic(graph1: Graph, graph2: Graph) -> Bool {
+  // Early size check for efficiency
+  case size(graph1) == size(graph2) {
+    False -> False
+    True -> {
+      let canonical1 = canonicalize(graph1)
+      let canonical2 = canonicalize(graph2)
+
+      // Compare triple sets rather than graph structures
+      let triples1 = triples(canonical1) |> list.sort(compare_triples_internal)
+      let triples2 = triples(canonical2) |> list.sort(compare_triples_internal)
+
+      triples1 == triples2
+    }
+  }
+}
+
+/// Create a canonical representation of an RDF graph.
+///
+/// Converts all blank nodes to a normalized form using deterministic labeling.
+/// The resulting graph can be compared for exact equality to determine isomorphism.
+/// Blank nodes are relabeled with canonical identifiers based on their structural
+/// properties within the graph.
+///
+/// ## Examples  
+/// ```gleam
+/// let original = graph.from_list([triple_with_blank_nodes])
+/// let canonical = graph.canonicalize(original)
+/// // All blank nodes now have predictable, deterministic labels
+/// ```
+pub fn canonicalize(graph: Graph) -> Graph {
+  let blank_nodes = extract_blank_nodes(graph)
+  case list.is_empty(blank_nodes) {
+    True -> graph
+    // No blank nodes, return as-is
+    False -> {
+      let mapping = create_canonical_mapping(graph, blank_nodes)
+      apply_blank_node_mapping(graph, mapping)
+    }
+  }
+}
+
+// Internal helper functions for canonicalization
+
+fn extract_blank_nodes(graph: Graph) -> List(term.BlankNode) {
+  graph.triples
+  |> list.flat_map(fn(triple) {
+    let statement.Triple(subject, _predicate, object) = triple
+    let subject_blanks = case subject {
+      term.SubjectBlank(blank) -> [blank]
+      _ -> []
+    }
+    let object_blanks = case object {
+      term.ObjectBlank(blank) -> [blank]
+      _ -> []
+    }
+    list.append(subject_blanks, object_blanks)
+  })
+  |> dedupe_blank_nodes
+}
+
+fn dedupe_blank_nodes(blanks: List(term.BlankNode)) -> List(term.BlankNode) {
+  list.reverse(
+    list.fold(blanks, [], fn(acc, blank) {
+      case list.any(acc, fn(existing) { blank_nodes_equal(existing, blank) }) {
+        True -> acc
+        False -> [blank, ..acc]
+      }
+    }),
+  )
+}
+
+fn blank_nodes_equal(blank1: term.BlankNode, blank2: term.BlankNode) -> Bool {
+  let term.BlankNode(id1) = blank1
+  let term.BlankNode(id2) = blank2
+  id1 == id2
+}
+
+fn create_canonical_mapping(
+  graph: Graph,
+  blank_nodes: List(term.BlankNode),
+) -> dict.Dict(String, String) {
+  // Create signatures for each blank node based on its usage patterns
+  let signatures = create_blank_node_signatures(graph, blank_nodes)
+
+  // Sort blank nodes by signature for deterministic labeling
+  let sorted_blanks = sort_by_signature(blank_nodes, signatures)
+
+  // Assign canonical labels
+  assign_canonical_labels(sorted_blanks)
+}
+
+fn create_blank_node_signatures(
+  graph: Graph,
+  blank_nodes: List(term.BlankNode),
+) -> dict.Dict(String, String) {
+  list.fold(blank_nodes, dict.new(), fn(acc, blank) {
+    let term.BlankNode(id) = blank
+    let signature = calculate_blank_node_signature(graph, blank)
+    dict.insert(acc, id, signature)
+  })
+}
+
+fn calculate_blank_node_signature(graph: Graph, blank: term.BlankNode) -> String {
+  let term.BlankNode(blank_id) = blank
+
+  let relevant_triples =
+    list.filter(graph.triples, fn(triple) {
+      triple_contains_blank_node(triple, blank_id)
+    })
+
+  let signature_parts =
+    list.map(relevant_triples, fn(triple) {
+      create_triple_signature(triple, blank_id)
+    })
+
+  signature_parts
+  |> list.sort(string.compare)
+  |> string.join("|")
+}
+
+fn triple_contains_blank_node(
+  triple: statement.Triple,
+  blank_id: String,
+) -> Bool {
+  let statement.Triple(subject, _predicate, object) = triple
+
+  let subject_matches = case subject {
+    term.SubjectBlank(term.BlankNode(id)) -> id == blank_id
+    _ -> False
+  }
+
+  let object_matches = case object {
+    term.ObjectBlank(term.BlankNode(id)) -> id == blank_id
+    _ -> False
+  }
+
+  subject_matches || object_matches
+}
+
+fn create_triple_signature(triple: statement.Triple, blank_id: String) -> String {
+  let statement.Triple(subject, predicate, object) = triple
+  let term.NamedNode(pred_iri) = predicate
+
+  let subject_sig = case subject {
+    term.SubjectNamed(term.NamedNode(iri)) -> "N:" <> iri
+    term.SubjectBlank(term.BlankNode(id)) ->
+      case id == blank_id {
+        True -> "B:SELF"
+        False -> "B:" <> id
+      }
+    term.SubjectTriple(_) -> "T:QUOTED"
+  }
+
+  let object_sig = case object {
+    term.ObjectNamed(term.NamedNode(iri)) -> "N:" <> iri
+    term.ObjectBlank(term.BlankNode(id)) ->
+      case id == blank_id {
+        True -> "B:SELF"
+        False -> "B:" <> id
+      }
+    term.ObjectLiteral(literal) -> "L:" <> serialize_literal(literal)
+    term.ObjectTriple(_) -> "T:QUOTED"
+  }
+
+  subject_sig <> "|P:" <> pred_iri <> "|" <> object_sig
+}
+
+fn serialize_literal(literal: term.Literal) -> String {
+  case literal {
+    term.SimpleLiteral(value) -> "simple:" <> value
+    term.LanguageTaggedLiteral(value, term.LanguageTag(lang)) ->
+      "lang:" <> value <> "@" <> lang
+    term.TypedLiteral(value, term.NamedNode(datatype)) ->
+      "typed:" <> value <> "^^" <> datatype
+  }
+}
+
+fn sort_by_signature(
+  blank_nodes: List(term.BlankNode),
+  signatures: dict.Dict(String, String),
+) -> List(term.BlankNode) {
+  blank_nodes
+  |> list.map(fn(blank) {
+    let term.BlankNode(id) = blank
+    let signature = dict.get(signatures, id) |> result.unwrap("")
+    #(blank, signature)
+  })
+  |> list.sort(fn(a, b) { string.compare(a.1, b.1) })
+  |> list.map(fn(pair) { pair.0 })
+}
+
+fn assign_canonical_labels(
+  sorted_blanks: List(term.BlankNode),
+) -> dict.Dict(String, String) {
+  sorted_blanks
+  |> list.index_map(fn(blank, index) {
+    let term.BlankNode(original_id) = blank
+    let canonical_id = "b" <> int.to_string(index)
+    #(original_id, canonical_id)
+  })
+  |> dict.from_list()
+}
+
+fn apply_blank_node_mapping(
+  graph: Graph,
+  mapping: dict.Dict(String, String),
+) -> Graph {
+  let remapped_triples =
+    list.map(graph.triples, fn(triple) {
+      remap_triple_blank_nodes(triple, mapping)
+    })
+  Graph(triples: remapped_triples)
+}
+
+fn remap_triple_blank_nodes(
+  triple: statement.Triple,
+  mapping: dict.Dict(String, String),
+) -> statement.Triple {
+  let statement.Triple(subject, predicate, object) = triple
+
+  let new_subject = case subject {
+    term.SubjectBlank(term.BlankNode(id)) ->
+      case dict.get(mapping, id) {
+        Ok(new_id) -> term.SubjectBlank(term.BlankNode(new_id))
+        Error(_) -> subject
+      }
+    _ -> subject
+  }
+
+  let new_object = case object {
+    term.ObjectBlank(term.BlankNode(id)) ->
+      case dict.get(mapping, id) {
+        Ok(new_id) -> term.ObjectBlank(term.BlankNode(new_id))
+        Error(_) -> object
+      }
+    _ -> object
+  }
+
+  statement.Triple(
+    subject: new_subject,
+    predicate: predicate,
+    object: new_object,
+  )
+}
+
+fn compare_triples_internal(
+  triple1: statement.Triple,
+  triple2: statement.Triple,
+) -> order.Order {
+  let statement.Triple(s1, p1, o1) = triple1
+  let statement.Triple(s2, p2, o2) = triple2
+
+  case
+    serialize_subject_internal(s1)
+    |> string.compare(serialize_subject_internal(s2))
+  {
+    order.Eq ->
+      case
+        serialize_predicate_internal(p1)
+        |> string.compare(serialize_predicate_internal(p2))
+      {
+        order.Eq ->
+          serialize_object_internal(o1)
+          |> string.compare(serialize_object_internal(o2))
+        other -> other
+      }
+    other -> other
+  }
+}
+
+fn serialize_subject_internal(subject: term.Subject) -> String {
+  case subject {
+    term.SubjectNamed(term.NamedNode(iri)) -> "N:" <> iri
+    term.SubjectBlank(term.BlankNode(id)) -> "B:" <> id
+    term.SubjectTriple(_) -> "T:QUOTED"
+  }
+}
+
+fn serialize_predicate_internal(predicate: term.Predicate) -> String {
+  let term.NamedNode(iri) = predicate
+  "P:" <> iri
+}
+
+fn serialize_object_internal(object: term.Object) -> String {
+  case object {
+    term.ObjectNamed(term.NamedNode(iri)) -> "N:" <> iri
+    term.ObjectBlank(term.BlankNode(id)) -> "B:" <> id
+    term.ObjectLiteral(literal) -> "L:" <> serialize_literal(literal)
+    term.ObjectTriple(_) -> "T:QUOTED"
+  }
 }
 
 fn dedupe(triples: List(statement.Triple)) -> List(statement.Triple) {

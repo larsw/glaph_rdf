@@ -18,6 +18,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import simplifile
 
 /// A complete N-Quads document representing an RDF dataset.
 ///
@@ -140,6 +141,114 @@ pub fn serialize_dataset(ds: dataset.Dataset) -> String {
       False -> content <> "\n"
     }
   }
+}
+
+/// Parse an N-Quads document from a file into a structured representation.
+///
+/// Reads an N-Quads file and parses its contents with one quad per line.
+/// Supports all RDF term types including IRIs, blank nodes, literals with 
+/// datatypes/languages, and RDF-star quoted triples. Returns detailed error 
+/// information with line numbers on file read failures or parse errors.
+///
+/// ## Examples
+/// ```gleam
+/// case nquads.parse_file("data/dataset.nq") {
+///   Ok(document) -> {
+///     let quad_count = dataset.quad_count(document.dataset)
+///   }
+///   Error(error) -> {
+///     // Handle file read or parsing error with line numbers
+///   }
+/// }
+/// ```
+pub fn parse_file(path: String) -> Result(NQuadsDocument, NQuadsError) {
+  case simplifile.read(path) {
+    Ok(contents) -> parse(contents)
+    Error(error) -> {
+      let error_msg = case error {
+        simplifile.Enoent -> "File not found"
+        simplifile.Eacces -> "Permission denied"
+        simplifile.Eisdir -> "Path is a directory"
+        _ -> "File read error"
+      }
+      Error(NQuadsError("File error: " <> error_msg <> " (" <> path <> ")", 0))
+    }
+  }
+}
+
+/// Parse an N-Quads file and extract only the RDF dataset content.
+///
+/// Convenience function that reads and parses an N-Quads file, returning 
+/// just the RDF dataset. Useful when you only need the actual RDF quads 
+/// with their named graph structure from the file.
+///
+/// ## Examples
+/// ```gleam
+/// case nquads.parse_dataset_file("data/graphs.nq") {
+///   Ok(rdf_dataset) -> {
+///     let graph_names = dataset.graph_names(rdf_dataset)
+///     // Work with the RDF dataset and named graphs directly
+///   }
+///   Error(error) -> // Handle file or parsing error
+/// }
+/// ```
+pub fn parse_dataset_file(path: String) -> Result(dataset.Dataset, NQuadsError) {
+  parse_file(path)
+  |> result.map(fn(doc) { doc.dataset })
+}
+
+/// Serialize an N-Quads document to a file.
+///
+/// Converts an N-Quads document to valid N-Quads syntax and writes it to 
+/// the specified file. Each quad becomes one line ending with a period.
+/// Creates parent directories if they don't exist.
+///
+/// ## Examples
+/// ```gleam
+/// let document = NQuadsDocument(dataset: my_dataset)
+/// 
+/// case nquads.serialize_to_file(document, "output/dataset.nq") {
+///   Ok(Nil) -> // File written successfully
+///   Error(error) -> // Handle file write error
+/// }
+/// ```
+pub fn serialize_to_file(
+  document: NQuadsDocument,
+  path: String,
+) -> Result(Nil, NQuadsError) {
+  let content = serialize(document)
+  case simplifile.write(path, content) {
+    Ok(Nil) -> Ok(Nil)
+    Error(error) -> {
+      let error_msg = case error {
+        simplifile.Enoent -> "Directory not found"
+        simplifile.Eacces -> "Permission denied"
+        simplifile.Enospc -> "No space left on device"
+        _ -> "File write error"
+      }
+      Error(NQuadsError("File error: " <> error_msg <> " (" <> path <> ")", 0))
+    }
+  }
+}
+
+/// Serialize an RDF dataset to an N-Quads file.
+///
+/// Convenience function that directly writes an RDF dataset to an N-Quads 
+/// file without wrapping in a document. Each quad becomes one line ending 
+/// with a period. Creates parent directories if they don't exist.
+///
+/// ## Examples
+/// ```gleam
+/// case nquads.serialize_dataset_to_file(my_dataset, "output/dataset.nq") {
+///   Ok(Nil) -> // Dataset written to file successfully
+///   Error(error) -> // Handle file write error
+/// }
+/// ```
+pub fn serialize_dataset_to_file(
+  ds: dataset.Dataset,
+  path: String,
+) -> Result(Nil, NQuadsError) {
+  serialize_to_file(NQuadsDocument(dataset: ds), path)
 }
 
 // Private functions

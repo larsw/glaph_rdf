@@ -11,6 +11,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import simplifile
 
 // Import the turtle module for parsing and reuse
 import glaph_rdf/serializers/turtle
@@ -203,6 +204,139 @@ pub fn serialize_dataset(
     prefixes: prefixes,
     dataset: dataset_value,
   ))
+}
+
+/// Parse a TriG document from a file into a structured representation.
+///
+/// Reads a TriG file and parses its contents including base declarations, 
+/// prefix definitions, and named graph blocks. Falls back to Turtle parsing 
+/// if no TriG-specific syntax is detected. Supports RDF-star quoted triples
+/// within all graphs. Returns detailed error information on file read failures 
+/// or parse errors.
+///
+/// ## Examples
+/// ```gleam
+/// case trig.parse_file("data/dataset.trig") {
+///   Ok(document) -> {
+///     // Access document.base, document.prefixes, document.dataset
+///     let graph_names = dataset.graph_names(document.dataset)
+///   }
+///   Error(error) -> {
+///     // Handle file read or parsing error
+///   }
+/// }
+/// ```
+pub fn parse_file(path: String) -> Result(TrigDocument, TrigError) {
+  case simplifile.read(path) {
+    Ok(contents) -> parse(contents)
+    Error(error) -> {
+      let error_msg = case error {
+        simplifile.Enoent -> "File not found"
+        simplifile.Eacces -> "Permission denied"
+        simplifile.Eisdir -> "Path is a directory"
+        _ -> "File read error"
+      }
+      Error(TrigError("File error: " <> error_msg <> " (" <> path <> ")", 0))
+    }
+  }
+}
+
+/// Parse a TriG file and extract only the RDF dataset content.
+///
+/// Convenience function that reads and parses a TriG file, returning just 
+/// the RDF dataset while discarding base IRI and prefix declarations. Useful 
+/// when you only need the actual RDF data with its named graph structure
+/// from the file.
+///
+/// ## Examples
+/// ```gleam
+/// case trig.parse_dataset_file("data/graphs.trig") {
+///   Ok(rdf_dataset) -> {
+///     let graph_names = dataset.graph_names(rdf_dataset)
+///     // Work with the RDF dataset and named graphs directly
+///   }
+///   Error(error) -> // Handle file or parsing error
+/// }
+/// ```
+pub fn parse_dataset_file(path: String) -> Result(dataset.Dataset, TrigError) {
+  parse_file(path)
+  |> result.map(fn(doc) { doc.dataset })
+}
+
+/// Serialize a TrigDocument to a file in TriG format.
+///
+/// Converts a structured TriG document to valid TriG syntax and writes it 
+/// to the specified file with named graph blocks. Creates parent directories 
+/// if they don't exist. Handles base declarations, prefix definitions, named 
+/// graphs, and RDF-star quoted triple serialization.
+///
+/// ## Examples
+/// ```gleam
+/// let document = TrigDocument(
+///   base: Some("http://example.org/"),
+///   prefixes: my_prefixes,
+///   dataset: my_dataset
+/// )
+/// 
+/// case trig.serialize_to_file(document, "output/dataset.trig") {
+///   Ok(Nil) -> // File written successfully
+///   Error(error) -> // Handle file write error
+/// }
+/// ```
+pub fn serialize_to_file(
+  document: TrigDocument,
+  path: String,
+) -> Result(Nil, TrigError) {
+  let content = serialize_document(document)
+  case simplifile.write(path, content) {
+    Ok(Nil) -> Ok(Nil)
+    Error(error) -> {
+      let error_msg = case error {
+        simplifile.Enoent -> "Directory not found"
+        simplifile.Eacces -> "Permission denied"
+        simplifile.Enospc -> "No space left on device"
+        _ -> "File write error"
+      }
+      Error(TrigError("File error: " <> error_msg <> " (" <> path <> ")", 0))
+    }
+  }
+}
+
+/// Serialize an RDF dataset to a TriG file with custom base and prefixes.
+///
+/// Convenience function that creates a TrigDocument from the provided 
+/// components and writes it to the specified file in TriG format with 
+/// named graph support. Allows direct file output of RDF datasets with 
+/// multiple named graphs, custom base IRI, and prefix definitions without 
+/// manually constructing a TrigDocument.
+///
+/// ## Examples
+/// ```gleam
+/// let prefixes = dict.from_list([
+///   ("ex", "http://example.org/"),
+///   ("foaf", "http://xmlns.com/foaf/0.1/")
+/// ])
+/// 
+/// case trig.serialize_dataset_to_file(
+///   my_rdf_dataset,
+///   Some("http://example.org/"),
+///   prefixes,
+///   "output/dataset.trig"
+/// ) {
+///   Ok(Nil) -> // Dataset written to file successfully
+///   Error(error) -> // Handle file write error
+/// }
+/// ```
+pub fn serialize_dataset_to_file(
+  dataset_value: dataset.Dataset,
+  base: Option(String),
+  prefixes: dict.Dict(String, String),
+  path: String,
+) -> Result(Nil, TrigError) {
+  serialize_to_file(
+    TrigDocument(base: base, prefixes: prefixes, dataset: dataset_value),
+    path,
+  )
 }
 
 fn serialize_document(document: TrigDocument) -> String {

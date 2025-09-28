@@ -12,6 +12,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
+import simplifile
 
 /// Error information from N-Triples parsing operations.
 ///
@@ -117,6 +118,113 @@ pub fn serialize_graph(rdf_graph: graph.Graph) -> String {
       False -> content <> "\n"
     }
   }
+}
+
+/// Parse an N-Triples document from a file into a structured representation.
+///
+/// Reads an N-Triples file and parses its contents with one triple per line.
+/// Supports all RDF term types and RDF-star quoted triples. Returns detailed 
+/// error information with line numbers on file read failures or parse errors.
+///
+/// ## Examples
+/// ```gleam
+/// case ntriples.parse_file("data/triples.nt") {
+///   Ok(document) -> {
+///     let triple_count = graph.size(document.graph)
+///   }
+///   Error(error) -> {
+///     // Handle file read or parsing error with line numbers
+///   }
+/// }
+/// ```
+pub fn parse_file(path: String) -> Result(NTriplesDocument, NTriplesError) {
+  case simplifile.read(path) {
+    Ok(contents) -> parse(contents)
+    Error(error) -> {
+      let error_msg = case error {
+        simplifile.Enoent -> "File not found"
+        simplifile.Eacces -> "Permission denied"
+        simplifile.Eisdir -> "Path is a directory"
+        _ -> "File read error"
+      }
+      Error(NTriplesError("File error: " <> error_msg <> " (" <> path <> ")", 0))
+    }
+  }
+}
+
+/// Parse an N-Triples file and extract only the RDF graph content.
+///
+/// Convenience function that reads and parses an N-Triples file, returning 
+/// just the RDF graph. Useful when you only need the actual RDF triples 
+/// from the file without document wrapper.
+///
+/// ## Examples
+/// ```gleam
+/// case ntriples.parse_graph_file("data/simple.nt") {
+///   Ok(rdf_graph) -> {
+///     let triple_count = graph.size(rdf_graph)
+///     // Work with the RDF graph directly
+///   }
+///   Error(error) -> // Handle file or parsing error
+/// }
+/// ```
+pub fn parse_graph_file(path: String) -> Result(graph.Graph, NTriplesError) {
+  parse_file(path)
+  |> result.map(fn(doc) { doc.graph })
+}
+
+/// Serialize an N-Triples document to a file.
+///
+/// Converts an N-Triples document to valid N-Triples syntax and writes it 
+/// to the specified file. Each triple becomes one line ending with a period.
+/// Creates parent directories if they don't exist.
+///
+/// ## Examples
+/// ```gleam
+/// let document = NTriplesDocument(graph: my_graph)
+/// 
+/// case ntriples.serialize_to_file(document, "output/triples.nt") {
+///   Ok(Nil) -> // File written successfully
+///   Error(error) -> // Handle file write error
+/// }
+/// ```
+pub fn serialize_to_file(
+  document: NTriplesDocument,
+  path: String,
+) -> Result(Nil, NTriplesError) {
+  let content = serialize(document)
+  case simplifile.write(path, content) {
+    Ok(Nil) -> Ok(Nil)
+    Error(error) -> {
+      let error_msg = case error {
+        simplifile.Enoent -> "Directory not found"
+        simplifile.Eacces -> "Permission denied"
+        simplifile.Enospc -> "No space left on device"
+        _ -> "File write error"
+      }
+      Error(NTriplesError("File error: " <> error_msg <> " (" <> path <> ")", 0))
+    }
+  }
+}
+
+/// Serialize an RDF graph to an N-Triples file.
+///
+/// Convenience function that directly writes an RDF graph to an N-Triples 
+/// file without wrapping in a document. Each triple becomes one line ending 
+/// with a period. Creates parent directories if they don't exist.
+///
+/// ## Examples
+/// ```gleam
+/// case ntriples.serialize_graph_to_file(my_graph, "output/graph.nt") {
+///   Ok(Nil) -> // Graph written to file successfully
+///   Error(error) -> // Handle file write error
+/// }
+/// ```
+pub fn serialize_graph_to_file(
+  rdf_graph: graph.Graph,
+  path: String,
+) -> Result(Nil, NTriplesError) {
+  serialize_to_file(NTriplesDocument(graph: rdf_graph), path)
 }
 
 // Internal parsing functions

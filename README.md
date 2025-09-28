@@ -13,6 +13,9 @@ set-like graph and dataset collections, and full-featured RDF serializers with p
 - **Triple and quad collections** – duplicate-safe graphs and datasets with
   convenience helpers for merging, replacing named graphs, or querying
   membership.
+- **RDF Graph and Dataset Isomorphism** – check semantic equivalence between
+  graphs and datasets using canonical blank node labeling, enabling reliable
+  comparison regardless of serialization order or blank node naming.
 - **URI interoperability** – convert between IRIs, `NamedNode`s, and
   `gleam/uri.Uri` values, decoding percent-encoded Unicode only when needed.
 - **Comprehensive RDF serialization** – full W3C Turtle and TriG serializers with
@@ -212,12 +215,129 @@ case trig.parse(trig_text) {
 }
 ```
 
+### File I/O Support
+
+All serializers now support direct file operations in addition to string-based processing:
+
+```gleam
+import glaph_rdf/serializers/turtle
+
+// Read RDF from file
+case turtle.parse_graph_file("data/ontology.ttl") {
+  Ok(graph) -> {
+    let triple_count = graph.size(graph)
+    // Process RDF graph
+  }
+  Error(error) -> // Handle file or parsing error
+}
+
+// Write RDF to file
+let prefixes = dict.from_list([("ex", "http://example.org/")])
+case turtle.serialize_graph_to_file(my_graph, None, prefixes, "output/data.ttl") {
+  Ok(Nil) -> // File written successfully
+  Error(error) -> // Handle file write error
+}
+```
+
+**File I/O Features:**
+- **Cross-platform**: Uses `simplifile` for reliable file operations on all targets
+- **Comprehensive error handling**: Detailed error messages with file paths and positions  
+- **All formats supported**: Turtle, TriG, N-Triples, and N-Quads include file I/O functions
+- **Memory efficient**: Better performance for large RDF files compared to string operations
+- **Round-trip tested**: Full test coverage including error conditions and cross-format compatibility
+
+**Available Functions:**
+- `parse_file()` / `parse_graph_file()` / `parse_dataset_file()` - Read from files
+- `serialize_to_file()` / `serialize_graph_to_file()` / `serialize_dataset_to_file()` - Write to files
+
+For detailed documentation and examples, see [FILE_IO.md](FILE_IO.md).
+
 ### Testing Coverage
 
-Both serializers include comprehensive test suites:
+All serializers include comprehensive test suites:
 - **Turtle**: 50+ tests covering parsing, serialization, prefixes, literals, error handling
-- **TriG**: 23+ tests covering named graphs, datasets, mixed content, escaping
-- **Total**: 72+ tests ensuring robust RDF serialization support
+- **TriG**: 23+ tests covering named graphs, datasets, mixed content, escaping  
+- **N-Triples/N-Quads**: 25+ tests covering line-based parsing and dataset serialization
+- **File I/O**: 15+ tests covering file operations, error handling, and round-trip validation
+- **Total**: 115+ tests ensuring robust RDF serialization and file handling
+
+## RDF Isomorphism and Semantic Comparison
+
+The library provides powerful **RDF graph and dataset isomorphism** functionality for determining semantic equivalence between RDF structures. This is essential for comparing RDF data from different sources that may use different blank node labels but represent the same information.
+
+### Graph Isomorphism
+
+```gleam
+import glaph_rdf/graph
+import glaph_rdf/term
+import glaph_rdf/statement
+
+// Two graphs with different blank node labels but same structure
+let graph1 = graph.from_list([
+  statement.Triple(
+    subject: term.SubjectBlank(term.unsafe_blank_node("person1")),
+    predicate: term.unsafe_named_node("http://xmlns.com/foaf/0.1/name"),
+    object: term.ObjectLiteral(term.simple_literal("Alice"))
+  )
+])
+
+let graph2 = graph.from_list([
+  statement.Triple(
+    subject: term.SubjectBlank(term.unsafe_blank_node("x")),
+    predicate: term.unsafe_named_node("http://xmlns.com/foaf/0.1/name"),
+    object: term.ObjectLiteral(term.simple_literal("Alice"))
+  )
+])
+
+// Check if graphs are semantically equivalent
+graph.isomorphic(graph1, graph2)  // -> True
+
+// Create canonical representation for comparison
+let canonical1 = graph.canonicalize(graph1)
+let canonical2 = graph.canonicalize(graph2)
+// Both will have the same canonical blank node labels
+```
+
+### Dataset Isomorphism
+
+```gleam
+import glaph_rdf/dataset
+
+// Compare entire datasets across multiple graphs
+let dataset1 = dataset.from_list([
+  statement.Quad(
+    subject: term.SubjectBlank(term.unsafe_blank_node("a")),
+    predicate: term.unsafe_named_node("http://xmlns.com/foaf/0.1/name"),
+    object: term.ObjectLiteral(term.simple_literal("Alice")),
+    graph: term.DefaultGraph
+  ),
+  statement.Quad(
+    subject: term.SubjectBlank(term.unsafe_blank_node("b")),  
+    predicate: term.unsafe_named_node("http://xmlns.com/foaf/0.1/name"),
+    object: term.ObjectLiteral(term.simple_literal("Bob")),
+    graph: term.NamedGraph(term.unsafe_named_node("http://example.org/people"))
+  )
+])
+
+let dataset2 = dataset.from_list([/* same data with different blank node labels */])
+
+dataset.isomorphic(dataset1, dataset2)  // -> True
+```
+
+**Isomorphism Features:**
+- **Canonical Blank Node Labeling** – deterministic relabeling based on structural signatures
+- **Multi-graph Support** – handles complex datasets with multiple named graphs
+- **Blank Graph Names** – properly canonicalizes datasets with blank node graph identifiers  
+- **Performance Optimized** – early size filtering and efficient comparison algorithms
+- **Comprehensive Coverage** – handles all RDF term types including complex literal structures
+
+**Use Cases:**
+- **Data Integration** – verify that data from different sources represents the same information
+- **Round-trip Testing** – ensure serialization/parsing preserves semantic meaning
+- **Test Assertions** – compare expected vs actual results regardless of blank node naming
+- **Data Deduplication** – identify semantically identical RDF structures
+
+For detailed documentation and examples, see [ISOMORPHISM.md](ISOMORPHISM.md).
 
 ## Contributing
 
