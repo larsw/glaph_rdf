@@ -136,7 +136,11 @@ pub fn graph_name_from_term(term: Term) -> Result(GraphName, TermError) {
 }
 
 /// Build an RDF triple from a subject, predicate, and object.
-pub fn triple(subject: Subject, predicate: Predicate, object: Object) -> Triple {
+pub fn triple(
+  subject: Subject,
+  predicate: Predicate,
+  object: Object,
+) -> Triple {
   statement_mod.triple(subject, predicate, object)
 }
 

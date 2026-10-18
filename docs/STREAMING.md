@@ -1,223 +1,164 @@
 # RDF Streaming Operations
 
-This document describes the streaming operations available in glaph_rdf for efficient processing of large RDF files.
+glaph_rdf can read and write the line-based formats **N-Triples** (`.nt`) and **N-Quads** (`.nq`) one line at a time, instead of holding the whole file text in memory. These formats suit streaming because every statement is self-contained on its own line.
 
-## Overview
+| Function | Reads/writes | Memory held |
+|----------|--------------|-------------|
+| `streaming_fold_file(path, from:, with:)` | one line at a time | the current line plus your accumulator (constant if your accumulator is) |
+| `streaming_parse_file(path)` | one line at a time | the resulting graph/dataset (grows with the number of statements) |
+| `streaming_serialize_to_file(graph_or_dataset, path)` | batches of lines | the input graph/dataset, plus one small batch of output text |
 
-The streaming operations allow you to process large RDF files without loading the entire content into memory. This is particularly useful for:
+All of them are available in both `glaph_rdf/serializers/ntriples` and `glaph_rdf/serializers/nquads`, and work on both the Erlang and JavaScript targets.
 
-- Large N-Triples and N-Quads files that exceed available memory
-- Processing RDF data in constrained memory environments
-- Real-time processing of RDF data streams
-- ETL operations on large RDF datasets
+## Constant-memory processing: `streaming_fold_file`
 
-## Supported Formats
-
-Streaming operations are currently supported for line-based RDF formats:
-
-- **N-Triples** (`.nt`) - Each triple on its own line
-- **N-Quads** (`.nq`) - Each quad on its own line
-
-These formats are ideal for streaming because they can be processed line by line without requiring context from other parts of the file.
-
-## N-Triples Streaming
-
-### Streaming Parse from File
+Use `streaming_fold_file` when the data may not fit in memory, or when you only need an aggregate (counts, filters, statistics, conversion). The callback receives every statement in file order, duplicates included. Blank lines and comments are skipped.
 
 ```gleam
+import gleam/int
+import gleam/io
 import glaph_rdf/serializers/ntriples
 
-case ntriples.streaming_parse_file("large_dataset.nt") {
-  Ok(document) -> {
-    // Successfully parsed the entire file
-    let triple_count = graph.size(document.graph)
-    io.println("Loaded " <> int.to_string(triple_count) <> " triples")
+pub fn count_triples(path: String) -> Nil {
+  case ntriples.streaming_fold_file(path, from: 0, with: fn(count, _triple) {
+    count + 1
+  }) {
+    Ok(count) -> io.println(int.to_string(count) <> " triples")
+    Error(ntriples.NTriplesError(message, line)) ->
+      io.println(message <> " (line " <> int.to_string(line) <> ")")
   }
-  Error(file_stream_error.Enoent) -> 
-    io.println("File not found")
-  Error(file_stream_error.Eacces) -> 
-    io.println("Permission denied")
-  Error(_) -> 
-    io.println("Error reading file")
 }
 ```
 
-### Streaming Serialize to File
-
-```gleam
-let large_graph = create_my_graph()
-
-case ntriples.streaming_serialize_to_file(large_graph, "output.nt") {
-  Ok(Nil) -> 
-    io.println("Successfully written to file")
-  Error(file_stream_error.Enospc) -> 
-    io.println("No space left on device")
-  Error(_) -> 
-    io.println("Error writing file")
-}
-```
-
-## N-Quads Streaming
-
-### Streaming Parse from File
+The N-Quads version passes a `statement.Quad`; statements without a graph label are in `term.DefaultGraph`:
 
 ```gleam
 import glaph_rdf/serializers/nquads
+import glaph_rdf/statement
+import glaph_rdf/term
 
-case nquads.streaming_parse_file("large_dataset.nq") {
-  Ok(document) -> {
-    // Successfully parsed the entire file
-    let quad_count = dataset.quad_count(document.dataset)
-    io.println("Loaded " <> int.to_string(quad_count) <> " quads")
+let count_named = fn(count: Int, quad: statement.Quad) {
+  case quad.graph {
+    term.DefaultGraph -> count
+    _ -> count + 1
   }
-  Error(file_stream_error.Enoent) -> 
-    io.println("File not found")
-  Error(_) -> 
-    io.println("Error reading file")
+}
+let result = nquads.streaming_fold_file("large.nq", from: 0, with: count_named)
+// -> Ok(number of quads in named graphs) or Error(nquads.NQuadsError(..))
+```
+
+## Loading a whole file: `streaming_parse_file`
+
+`streaming_parse_file` reads the file line by line, so the file text is never loaded as one string, but it still builds the complete graph or dataset in memory. Its result is equal (`==`) to what `parse_file` returns for the same file, including statement order and duplicate removal; graphs are built with an O(n log n) bulk constructor.
+
+```gleam
+import gleam/int
+import gleam/io
+import glaph_rdf/graph
+import glaph_rdf/serializers/ntriples
+
+case ntriples.streaming_parse_file("dataset.nt") {
+  Ok(document) ->
+    io.println(int.to_string(graph.size(document.graph)) <> " triples")
+  Error(ntriples.NTriplesError(message, line)) ->
+    io.println(message <> " (line " <> int.to_string(line) <> ")")
 }
 ```
 
-### Streaming Serialize to File
+`nquads.streaming_parse_file(path)` works the same way and returns `Result(nquads.NQuadsDocument, nquads.NQuadsError)`.
+
+## Writing: `streaming_serialize_to_file`
+
+`streaming_serialize_to_file` writes the statements in batches instead of building the whole document as one string. The file content is byte-for-byte the same as `ntriples.serialize_graph` / `nquads.serialize_dataset`. The file is created or truncated.
 
 ```gleam
-let large_dataset = create_my_dataset()
+import gleam/io
+import glaph_rdf/serializers/nquads
 
-case nquads.streaming_serialize_to_file(large_dataset, "output.nq") {
-  Ok(Nil) -> 
-    io.println("Successfully written to file")
-  Error(_) -> 
-    io.println("Error writing file")
+case nquads.streaming_serialize_to_file(my_dataset, "output.nq") {
+  Ok(Nil) -> io.println("Written")
+  Error(nquads.NQuadsError(message, _line)) -> io.println(message)
 }
 ```
 
-## Performance Benefits
+Errors that only surface when the file is closed (buffered writes failing on a full disk, for example) are reported too.
 
-### Memory Usage
+## Error handling
 
-Streaming operations provide significant memory benefits:
+The streaming functions return the same error types as their non-streaming siblings, so you never need to import `file_streams` yourself:
 
-- **Regular parsing**: Loads entire file content into memory at once
-- **Streaming parsing**: Processes one line at a time, constant memory usage
+- `ntriples.NTriplesError(message: String, line: Int)`
+- `nquads.NQuadsError(message: String, line: Int)`
 
-### Example Memory Comparison
+| Failure | `message` | `line` |
+|---------|-----------|--------|
+| Syntax error | the parser's message, identical to `parse_file` | the offending line (1-based, counting blank and comment lines) |
+| Invalid UTF-8 | `"File error: Invalid UTF-8 (<path>)"` | the offending line |
+| Opening, writing or closing the file | `"File error: <description> (<path>)"`, e.g. `"File error: No such file or directory (data.nt)"` | `0` |
+| Reading the file | `"File error: <description> (<path>)"` | the line that could not be read |
 
-```gleam
-// Regular parsing - loads entire file into memory
-let content = simplifile.read("1gb_file.nt")  // Uses ~1GB RAM
-let document = ntriples.parse(content)
-
-// Streaming parsing - constant memory usage
-let document = ntriples.streaming_parse_file("1gb_file.nt")  // Uses ~few KB RAM
-```
-
-### Throughput
-
-Streaming operations can actually be faster for large files because:
-
-1. No need to allocate memory for the entire file content
-2. Reduced garbage collection pressure  
-3. Better CPU cache utilization
-4. Can start processing immediately (no need to wait for entire file to load)
-
-## Error Handling
-
-Streaming operations return `file_stream_error.FileStreamError` types that provide detailed error information:
+For a syntax error, `streaming_parse_file(path)` and `parse_file(path)` return exactly the same error value. This also holds for CRLF files: both strip one trailing CR from every line before parsing it. The two differ only for invalid UTF-8, where `parse_file` reports `"File error: File read error (<path>)"` with line `0` because it decodes the whole file at once.
 
 ```gleam
-import file_streams/file_stream_error
+import gleam/int
+import gleam/io
+import glaph_rdf/serializers/ntriples
 
-case ntriples.streaming_parse_file(filename) {
+case ntriples.streaming_parse_file(path) {
   Ok(document) -> process_document(document)
-  Error(file_stream_error.Enoent) -> io.println("File not found")
-  Error(file_stream_error.Eacces) -> io.println("Permission denied")
-  Error(file_stream_error.Enospc) -> io.println("No space left on device")
-  Error(file_stream_error.Eio) -> io.println("I/O error or parse error")
-  Error(file_stream_error.Eof) -> io.println("Unexpected end of file")
-  Error(err) -> {
-    io.println("Other error: " <> file_stream_error.describe(err))
-  }
+  Error(ntriples.NTriplesError(message, 0)) ->
+    io.println("Could not access the file: " <> message)
+  Error(ntriples.NTriplesError(message, line)) ->
+    io.println("Line " <> int.to_string(line) <> ": " <> message)
 }
 ```
 
-## Best Practices
-
-### When to Use Streaming
-
-Use streaming operations when:
-
-- File size > 100MB
-- Available memory < 2x file size
-- Processing files in server environments with memory constraints
-- Building ETL pipelines for RDF data
-- Real-time processing requirements
-
-### When to Use Regular Operations
-
-Use regular file I/O operations when:
-
-- File size < 50MB
-- Need random access to triples/quads
-- Building interactive applications
-- Memory is abundant
-
-### Combining with Other Operations
-
-Streaming operations work well with other glaph_rdf features:
+## Combining with in-memory operations
 
 ```gleam
-// Stream large file, then use in-memory operations
-case ntriples.streaming_parse_file("large.nt") {
-  Ok(document) -> {
-    // Now use regular operations on the loaded graph
-    let filtered_graph = document.graph
+import gleam/list
+import gleam/result
+import glaph_rdf/graph
+import glaph_rdf/serializers/ntriples
+import glaph_rdf/statement
+
+pub fn filter_file(
+  keep: fn(statement.Triple) -> Bool,
+) -> Result(Nil, ntriples.NTriplesError) {
+  use document <- result.try(ntriples.streaming_parse_file("large.nt"))
+  let filtered =
+    document.graph
     |> graph.triples
-    |> list.filter(some_predicate)
+    |> list.filter(keep)
     |> graph.from_list
-    
-    // Stream the filtered results to a new file
-    ntriples.streaming_serialize_to_file(filtered_graph, "filtered.nt")
-  }
-  Error(_) -> io.println("Failed to load")
+  ntriples.streaming_serialize_to_file(filtered, "filtered.nt")
 }
 ```
 
-## Implementation Details
+To filter a file that does not fit in memory, collect only the matching triples with `streaming_fold_file` instead:
 
-### Line-by-Line Processing
-
-The streaming implementation reads and processes one line at a time:
-
-1. Open file stream
-2. Read line
-3. Parse line to RDF triple/quad  
-4. Add to accumulating graph/dataset
-5. Repeat until EOF
-6. Close file stream
-
-### Memory Management
-
-- Only one line is held in memory at any time
-- Graph/dataset grows incrementally 
-- Automatic cleanup of file handles
-- Error recovery with proper resource management
-
-### Platform Support
-
-Streaming operations work on all platforms supported by the file_streams library:
-
-- Erlang target: Full support
-- JavaScript target: Full support with some limitations (see file_streams documentation)
-
-## Dependencies
-
-Streaming operations require the `file_streams` library which is automatically included:
-
-```toml
-# In gleam.toml
-[dependencies]
-file_streams = ">= 1.6.0 and < 2.0.0"
+```gleam
+use kept <- result.try(
+  ntriples.streaming_fold_file("large.nt", from: [], with: fn(acc, triple) {
+    case keep(triple) {
+      True -> [triple, ..acc]
+      False -> acc
+    }
+  }),
+)
+ntriples.streaming_serialize_to_file(
+  graph.from_list(list.reverse(kept)),
+  "filtered.nt",
+)
 ```
+
+## Implementation notes
+
+- Files are read in 64 KiB chunks and split into lines by an internal line reader. It accepts LF and CRLF line endings, a missing final newline, and multi-byte UTF-8 characters that straddle chunk boundaries.
+- A UTF-8 byte order mark (U+FEFF) at the very start of the file is skipped, as `parse_file` does. U+FEFF anywhere else, including at the start of a later line, is a syntax error, on both targets.
+- The file is always closed, also when parsing or writing fails.
+- Streaming parsing gives the same results on Erlang and JavaScript.
 
 ## Examples
 
-See `test/streaming_test.gleam` for comprehensive examples and `src/streaming_demo.gleam` for a working demonstration.
+See `test/streaming_test.gleam` for tested examples of every function above.

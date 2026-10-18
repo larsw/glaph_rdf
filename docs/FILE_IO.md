@@ -4,7 +4,7 @@ This document provides comprehensive documentation for the file input/output fun
 
 ## Overview
 
-All RDF serializers in glaph_rdf now support direct file operations in addition to string-based serialization. This enables efficient processing of large RDF documents without requiring entire files to be loaded into memory as strings.
+All RDF serializers in glaph_rdf support direct file operations in addition to string-based serialization. `parse_file` and `serialize_to_file` read or write the whole file content at once. For large N-Triples and N-Quads files, the streaming functions read and write line by line instead; see [STREAMING.md](STREAMING.md).
 
 ## Supported Formats
 
@@ -366,17 +366,23 @@ pub fn safe_parse_file(path: String) -> Result(graph.Graph, String) {
 }
 ```
 
+## Encoding and Line Endings
+
+- Files are read as UTF-8. A file that is not valid UTF-8 gives a `"File error: File read error (<path>)"` error with position/line `0`.
+- A UTF-8 byte order mark (U+FEFF) at the very start of a file is skipped by every `parse_file` function and by the streaming parsers. U+FEFF anywhere else is parsed as ordinary text, so in N-Triples and N-Quads it is a syntax error. `parse(text)` never skips it. All of this behaves the same on Erlang and JavaScript.
+- N-Triples and N-Quads accept LF and CRLF line endings: `parse`, `parse_file` and the streaming parsers all strip one trailing CR from each line, so a CRLF file gives the same result, and the same error for a bad line, as its LF version.
+
 ## Performance Considerations
 
 ### Memory Usage
-- **File I/O**: More memory efficient for large files compared to string-based operations
-- **Streaming**: Current implementation loads entire file content; streaming support may be added in future versions
+- **`parse_file` / `serialize_to_file`**: Read or write the whole file content as one string, in addition to the parsed graph or dataset
+- **Streaming (N-Triples and N-Quads only)**: `streaming_parse_file` reads one line at a time but still holds the resulting graph/dataset; `streaming_fold_file` processes statements one at a time in constant memory; `streaming_serialize_to_file` writes in batches. See [STREAMING.md](STREAMING.md)
 - **Caching**: Consider caching parsed results for frequently accessed files
 
 ### File Size Recommendations
-- **Small files** (< 1MB): String or file operations perform similarly
-- **Medium files** (1MB - 100MB): File operations recommended for better memory usage  
-- **Large files** (> 100MB): File operations essential; consider splitting into smaller chunks
+- **Small and medium files**: `parse_file` / `serialize_to_file` in any format
+- **Large N-Triples/N-Quads files**: `streaming_parse_file` and `streaming_serialize_to_file` avoid holding the file text in memory
+- **Files whose statements do not fit in memory**: `streaming_fold_file`, or convert Turtle/TriG to N-Triples/N-Quads first
 
 ### Optimizations
 - Use format-specific parsers when file format is known
@@ -428,7 +434,7 @@ turtle.serialize_graph_to_file(graph, base_uri, standard_prefixes, output_path)
 ## Future Enhancements
 
 ### Planned Features
-- **Streaming Parsers**: Process large files without loading entire content into memory
+- **Streaming for Turtle/TriG**: N-Triples and N-Quads already support streaming (see [STREAMING.md](STREAMING.md))
 - **Compression Support**: Automatic handling of `.gz`, `.bz2`, and other compressed formats
 - **Parallel Processing**: Multi-threaded file operations for better performance
 - **Progress Callbacks**: Monitor progress for large file operations

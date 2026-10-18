@@ -2,13 +2,13 @@ name = "glaph_rdf"
 version = "0.1.0"
 description = "RDF 1.2 library for Gleam with support for Turtle, TriG, N-Triples and N-Quads."
 licences = ["Apache-2.0"]
+gleam = ">= 1.16.0"
 
 [dependencies]
-gleam_stdlib = ">= 0.44.0 and < 2.0.0"
+gleam_stdlib = ">= 1.0.0 and < 2.0.0"
 simplifile = ">= 2.3.0 and < 3.0.0"
-envoy = ">= 1.0.2 and < 2.0.0"
+file_streams = ">= 1.6.0 and < 3.0.0"
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
-iterator = ">= 0.0.5 and < 1.0.0"
-file_streams = ">= 1.6.0 and < 2.0.0"
+envoy = ">= 1.2.0 and < 2.0.0"

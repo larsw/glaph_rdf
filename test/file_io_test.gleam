@@ -9,6 +9,7 @@ import glaph_rdf/statement
 import glaph_rdf/term
 import gleam/dict
 import gleam/int
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import gleeunit
@@ -19,29 +20,47 @@ pub fn main() {
   gleeunit.main()
 }
 
-// Platform-agnostic temporary directory helper
+// Platform-agnostic temporary directory helper.
+// Works on both the Erlang and JavaScript targets: envoy reads the process
+// environment on the BEAM, Node, Bun and Deno. Empty variables are skipped and
+// a trailing separator (macOS sets TMPDIR to ".../T/") is removed.
 fn get_temp_dir() -> String {
-  // Try different environment variables in order of preference
-  case envoy.get("TMPDIR") {
-    Ok(dir) -> dir
-    Error(_) ->
-      case envoy.get("TMP") {
-        Ok(dir) -> dir
-        Error(_) ->
-          case envoy.get("TEMP") {
-            Ok(dir) -> dir
-            Error(_) ->
-              // Fall back to platform-specific defaults
-              case envoy.get("OS") {
-                Ok(os) ->
-                  case string.contains(string.lowercase(os), "windows") {
-                    True -> "C:\\Windows\\Temp"
-                    False -> "/tmp"
-                  }
-                Error(_) -> "/tmp"
-                // Unix-like systems default
-              }
+  let from_env =
+    ["TMPDIR", "TMP", "TEMP"]
+    |> list.find_map(fn(name) {
+      case envoy.get(name) {
+        Ok(dir) ->
+          case string.trim(dir) {
+            "" -> Error(Nil)
+            dir -> Ok(dir)
           }
+        Error(_) -> Error(Nil)
+      }
+    })
+  let dir = case from_env {
+    Ok(dir) -> dir
+    // Fall back to platform-specific defaults
+    Error(_) ->
+      case envoy.get("OS") {
+        Ok(os) ->
+          case string.contains(string.lowercase(os), "windows") {
+            True -> "C:\\Windows\\Temp"
+            False -> "/tmp"
+          }
+        // Unix-like systems default
+        Error(_) -> "/tmp"
+      }
+  }
+  strip_trailing_separator(dir)
+}
+
+fn strip_trailing_separator(dir: String) -> String {
+  case string.length(dir) > 1 {
+    False -> dir
+    True ->
+      case string.ends_with(dir, "/") || string.ends_with(dir, "\\") {
+        True -> strip_trailing_separator(string.drop_end(dir, 1))
+        False -> dir
       }
   }
 }
@@ -49,20 +68,58 @@ fn get_temp_dir() -> String {
 // Generate a unique temporary file path
 fn get_temp_file_path(filename: String) -> String {
   let temp_dir = get_temp_dir()
-  // Use a simple timestamp-based approach for uniqueness
-  let timestamp = int.to_string(erlang_system_time())
-  let separator = case string.contains(temp_dir, "\\") {
-    True -> "\\"
+  // Wall-clock time plus a per-process counter, so paths are unique even when
+  // two calls happen within the same clock tick.
+  let id = int.to_string(unique_id())
+  let separator = case
+    string.ends_with(temp_dir, "/") || string.ends_with(temp_dir, "\\"),
+    string.contains(temp_dir, "\\")
+  {
+    // Root directory such as "/" already ends with a separator
+    True, _ -> ""
     // Windows
-    False -> "/"
+    False, True -> "\\"
     // Unix-like
+    False, False -> "/"
   }
-  temp_dir <> separator <> "glaph_rdf_test_" <> timestamp <> "_" <> filename
+  temp_dir <> separator <> "glaph_rdf_test_" <> id <> "_" <> filename
 }
 
-// External function to get system time for unique file names
-@external(erlang, "erlang", "system_time")
-fn erlang_system_time() -> Int
+// Unique integer for temp file names, implemented for both targets.
+@external(erlang, "file_io_test_ffi", "unique_id")
+@external(javascript, "./file_io_test_ffi.mjs", "unique_id")
+fn unique_id() -> Int
+
+// Regression: get_temp_file_path used to rely on an Erlang-only external,
+// so this module (and the whole JS test build) failed to compile.
+pub fn temp_file_paths_are_unique_test() {
+  let first = get_temp_file_path("same.ttl")
+  let second = get_temp_file_path("same.ttl")
+  { first != second } |> should.be_true
+  string.ends_with(first, "_same.ttl") |> should.be_true
+}
+
+pub fn temp_dir_has_no_trailing_separator_test() {
+  let dir = get_temp_dir()
+  { dir != "" } |> should.be_true
+  string.contains(get_temp_file_path("x.nt"), "//") |> should.be_false
+}
+
+pub fn strip_trailing_separator_test() {
+  strip_trailing_separator("/var/folders/T/") |> should.equal("/var/folders/T")
+  strip_trailing_separator("C:\\Temp\\") |> should.equal("C:\\Temp")
+  strip_trailing_separator("/") |> should.equal("/")
+  strip_trailing_separator("/tmp") |> should.equal("/tmp")
+}
+
+// Temp files written through the library can be read back on every target.
+pub fn temp_file_write_read_test() {
+  let path = get_temp_file_path("portable.txt")
+  let assert Ok(Nil) = simplifile.write(path, "hello")
+  simplifile.read(path) |> should.equal(Ok("hello"))
+  let _ = simplifile.delete(path)
+  Nil
+}
 
 // Test data setup
 fn create_test_graph() -> graph.Graph {

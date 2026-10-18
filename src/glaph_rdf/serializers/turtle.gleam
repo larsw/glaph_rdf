@@ -4,6 +4,7 @@
 //// Serialization /////////////////////////////////////////////////////////////
 
 import glaph_rdf/graph
+import glaph_rdf/internal/utf8
 import glaph_rdf/statement
 import glaph_rdf/term
 import gleam/dict
@@ -12,7 +13,6 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
-import gleam/uri
 import simplifile
 
 const rdf_type = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
@@ -224,7 +224,7 @@ pub fn serialize_graph(
 /// }
 /// ```
 pub fn parse_file(path: String) -> Result(TurtleDocument, TurtleError) {
-  case simplifile.read(path) {
+  case utf8.read_file(path) {
     Ok(contents) -> parse(contents)
     Error(error) -> {
       let error_msg = case error {
@@ -506,7 +506,9 @@ fn collect_string(
   }
 }
 
-fn parse_escape(state: LexerState) -> Result(#(String, LexerState), TurtleError) {
+fn parse_escape(
+  state: LexerState,
+) -> Result(#(String, LexerState), TurtleError) {
   case state {
     LexerState(chars, pos) ->
       case list.is_empty(chars) {
@@ -1263,24 +1265,186 @@ fn apply_base(
 ) -> Result(String, TurtleError) {
   case base {
     None -> Ok(iri)
-    Some(base_iri) ->
-      case string.contains(iri, ":") {
-        True -> Ok(iri)
-        False ->
-          case uri.parse(base_iri) {
-            Ok(base_uri) ->
-              case uri.parse(iri) {
-                Ok(relative) ->
-                  case uri.merge(base_uri, relative) {
-                    Ok(merged) -> Ok(uri.to_string(merged))
-                    Error(_) -> Ok(base_iri <> iri)
-                  }
-                Error(_) -> Ok(base_iri <> iri)
-              }
-            Error(_) -> Ok(base_iri <> iri)
-          }
+    Some(base_iri) -> {
+      let reference = parse_iri_reference(iri)
+      case reference.scheme {
+        Some(_) -> Ok(iri)
+        None ->
+          Ok(
+            recompose_iri(resolve_reference(
+              parse_iri_reference(base_iri),
+              reference,
+            )),
+          )
+      }
+    }
+  }
+}
+
+/// The five components of an IRI reference (RFC 3986 section 3).
+type IriReference {
+  IriReference(
+    scheme: Option(String),
+    authority: Option(String),
+    path: String,
+    query: Option(String),
+    fragment: Option(String),
+  )
+}
+
+// Relative references are resolved with the RFC 3986 section 5.2 algorithm,
+// which Turtle and TriG require. gleam/uri is not used because its JavaScript
+// parser reads a relative path such as `c/d` as scheme `c` and path `/d`, and
+// its Erlang parser lowercases the scheme, so the two targets disagreed.
+fn parse_iri_reference(value: String) -> IriReference {
+  let #(rest, fragment) = case string.split_once(value, "#") {
+    Ok(#(before, after)) -> #(before, Some(after))
+    Error(_) -> #(value, None)
+  }
+  let #(rest, query) = case string.split_once(rest, "?") {
+    Ok(#(before, after)) -> #(before, Some(after))
+    Error(_) -> #(rest, None)
+  }
+  let #(scheme, rest) = case string.split_once(rest, ":") {
+    Ok(#(candidate, after)) ->
+      case is_valid_scheme(candidate) {
+        True -> #(Some(candidate), after)
+        False -> #(None, rest)
+      }
+    Error(_) -> #(None, rest)
+  }
+  let #(authority, path) = case rest {
+    "//" <> after ->
+      case string.split_once(after, "/") {
+        Ok(#(auth, path)) -> #(Some(auth), "/" <> path)
+        Error(_) -> #(Some(after), "")
+      }
+    _ -> #(None, rest)
+  }
+  IriReference(scheme:, authority:, path:, query:, fragment:)
+}
+
+fn is_valid_scheme(candidate: String) -> Bool {
+  case string.to_graphemes(candidate) {
+    [first, ..rest] ->
+      is_ascii_letter(first)
+      && list.all(rest, fn(char) {
+        is_ascii_letter(char)
+        || is_ascii_digit(char)
+        || char == "+"
+        || char == "-"
+        || char == "."
+      })
+    [] -> False
+  }
+}
+
+fn is_ascii_letter(char: String) -> Bool {
+  string.contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ", char)
+  && string.length(char) == 1
+}
+
+fn is_ascii_digit(char: String) -> Bool {
+  string.contains("0123456789", char) && string.length(char) == 1
+}
+
+fn resolve_reference(base: IriReference, ref: IriReference) -> IriReference {
+  case ref.authority, ref.path {
+    Some(_), _ ->
+      IriReference(
+        ..ref,
+        scheme: base.scheme,
+        path: remove_dot_segments(ref.path),
+      )
+    None, "" ->
+      IriReference(
+        ..base,
+        query: option.or(ref.query, base.query),
+        fragment: ref.fragment,
+      )
+    None, "/" <> _ ->
+      IriReference(
+        ..base,
+        path: remove_dot_segments(ref.path),
+        query: ref.query,
+        fragment: ref.fragment,
+      )
+    None, _ ->
+      IriReference(
+        ..base,
+        path: remove_dot_segments(merge_paths(base, ref.path)),
+        query: ref.query,
+        fragment: ref.fragment,
+      )
+  }
+}
+
+fn merge_paths(base: IriReference, ref_path: String) -> String {
+  case base.authority, base.path {
+    Some(_), "" -> "/" <> ref_path
+    _, _ ->
+      case string.split(base.path, "/") |> list.reverse {
+        [_last, ..directories] ->
+          string.join(list.reverse(["", ..directories]), "/") <> ref_path
+        [] -> ref_path
       }
   }
+}
+
+fn remove_dot_segments(path: String) -> String {
+  remove_dot_segments_loop(path, [])
+}
+
+fn remove_dot_segments_loop(input: String, output: List(String)) -> String {
+  case input {
+    "" -> string.concat(list.reverse(output))
+    "../" <> rest | "./" <> rest -> remove_dot_segments_loop(rest, output)
+    "/./" <> rest -> remove_dot_segments_loop("/" <> rest, output)
+    "/." -> remove_dot_segments_loop("/", output)
+    "/../" <> rest ->
+      remove_dot_segments_loop("/" <> rest, drop_segment(output))
+    "/.." -> remove_dot_segments_loop("/", drop_segment(output))
+    "." | ".." -> remove_dot_segments_loop("", output)
+    "/" <> rest ->
+      case string.split_once(rest, "/") {
+        Ok(#(segment, tail)) ->
+          remove_dot_segments_loop("/" <> tail, ["/" <> segment, ..output])
+        Error(_) -> remove_dot_segments_loop("", ["/" <> rest, ..output])
+      }
+    _ ->
+      case string.split_once(input, "/") {
+        Ok(#(segment, tail)) ->
+          remove_dot_segments_loop("/" <> tail, [segment, ..output])
+        Error(_) -> remove_dot_segments_loop("", [input, ..output])
+      }
+  }
+}
+
+fn drop_segment(output: List(String)) -> List(String) {
+  case output {
+    [_, ..rest] -> rest
+    [] -> []
+  }
+}
+
+fn recompose_iri(ref: IriReference) -> String {
+  let scheme = case ref.scheme {
+    Some(scheme) -> scheme <> ":"
+    None -> ""
+  }
+  let authority = case ref.authority {
+    Some(authority) -> "//" <> authority
+    None -> ""
+  }
+  let query = case ref.query {
+    Some(query) -> "?" <> query
+    None -> ""
+  }
+  let fragment = case ref.fragment {
+    Some(fragment) -> "#" <> fragment
+    None -> ""
+  }
+  scheme <> authority <> ref.path <> query <> fragment
 }
 
 fn serialize_document(document: TurtleDocument) -> String {
@@ -1440,18 +1604,25 @@ fn find_prefix(
     dict.to_list(prefixes)
     |> list.fold(None, fn(current, entry) {
       let #(name, ns) = entry
-      case string.starts_with(iri, ns) {
-        True -> {
-          let local = string.drop_start(iri, string.length(ns))
-          case current {
-            None -> Some(#(name, local, string.length(ns)))
-            Some(#(best_name, best_local, best_len)) ->
-              case string.length(ns) > best_len {
-                True -> Some(#(name, local, string.length(ns)))
-                False -> Some(#(best_name, best_local, best_len))
+      // Strip the namespace with split_once rather than string.drop_start:
+      // on the JavaScript target drop_start mixes UTF-8 byte and UTF-16 unit
+      // offsets, which corrupts the local name for non-ASCII namespaces.
+      case ns != "" && string.starts_with(iri, ns) {
+        True ->
+          case string.split_once(iri, ns) {
+            Ok(#("", local)) -> {
+              let ns_len = string.length(ns)
+              case current {
+                None -> Some(#(name, local, ns_len))
+                Some(#(best_name, best_local, best_len)) ->
+                  case ns_len > best_len {
+                    True -> Some(#(name, local, ns_len))
+                    False -> Some(#(best_name, best_local, best_len))
+                  }
               }
+            }
+            _ -> current
           }
-        }
         False -> current
       }
     })

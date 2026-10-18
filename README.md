@@ -247,14 +247,15 @@ case turtle.serialize_graph_to_file(my_graph, None, prefixes, "output/data.ttl")
 - **Cross-platform**: Uses `simplifile` for reliable file operations on all targets
 - **Comprehensive error handling**: Detailed error messages with file paths and positions  
 - **All formats supported**: Turtle, TriG, N-Triples, and N-Quads include file I/O functions
-- **Memory efficient**: Better performance for large RDF files compared to string operations
+- **Streaming for N-Triples/N-Quads**: `streaming_parse_file` and `streaming_serialize_to_file` read and write line by line on both targets; `streaming_fold_file` processes a file in constant memory
 - **Round-trip tested**: Full test coverage including error conditions and cross-format compatibility
 
 **Available Functions:**
 - `parse_file()` / `parse_graph_file()` / `parse_dataset_file()` - Read from files
 - `serialize_to_file()` / `serialize_graph_to_file()` / `serialize_dataset_to_file()` - Write to files
+- `streaming_parse_file()` / `streaming_fold_file()` / `streaming_serialize_to_file()` - Line-by-line file I/O (N-Triples and N-Quads)
 
-For detailed documentation and examples, see [FILE_IO.md](docs/FILE_IO.md).
+For detailed documentation and examples, see [FILE_IO.md](docs/FILE_IO.md) and, for streaming, [STREAMING.md](docs/STREAMING.md).
 
 ### Testing Coverage
 

@@ -11,13 +11,13 @@
 //// Supports full RDF-star syntax with quoted triples using `<<( ... )>>` notation
 //// in subject and object positions, following the RDF-star specification extensions.
 
-import file_streams/file_stream
-import file_streams/file_stream_error
 import glaph_rdf/dataset
+import glaph_rdf/internal/rdf_syntax
+import glaph_rdf/internal/streaming
+import glaph_rdf/internal/utf8
 import glaph_rdf/statement
-import glaph_rdf/term
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import simplifile
@@ -70,8 +70,8 @@ pub type NQuadsError {
 /// }
 /// ```
 pub fn parse(text: String) -> Result(NQuadsDocument, NQuadsError) {
-  let lines = string.split(text, "\n")
-  parse_lines(lines, 1, dataset.new())
+  let lines = rdf_syntax.split_lines(text)
+  parse_lines(lines, 1, [])
   |> result.map(NQuadsDocument)
 }
 
@@ -124,18 +124,7 @@ pub fn serialize(document: NQuadsDocument) -> String {
 /// ```
 pub fn serialize_dataset(ds: dataset.Dataset) -> String {
   dataset.quads(ds)
-  |> list.map(fn(quad) {
-    let statement.Quad(subject, predicate, object, graph) = quad
-    case graph {
-      term.DefaultGraph ->
-        serialize_triple_to_nquads(statement.Triple(subject, predicate, object))
-      _ ->
-        serialize_quad_to_nquads(
-          statement.Triple(subject, predicate, object),
-          graph,
-        )
-    }
-  })
+  |> list.map(rdf_syntax.serialize_quad)
   |> string.join("\n")
   |> fn(content) {
     case string.is_empty(content) {
@@ -164,7 +153,7 @@ pub fn serialize_dataset(ds: dataset.Dataset) -> String {
 /// }
 /// ```
 pub fn parse_file(path: String) -> Result(NQuadsDocument, NQuadsError) {
-  case simplifile.read(path) {
+  case utf8.read_file(path) {
     Ok(contents) -> parse(contents)
     Error(error) -> {
       let error_msg = case error {
@@ -194,7 +183,9 @@ pub fn parse_file(path: String) -> Result(NQuadsDocument, NQuadsError) {
 ///   Error(error) -> // Handle file or parsing error
 /// }
 /// ```
-pub fn parse_dataset_file(path: String) -> Result(dataset.Dataset, NQuadsError) {
+pub fn parse_dataset_file(
+  path: String,
+) -> Result(dataset.Dataset, NQuadsError) {
   parse_file(path)
   |> result.map(fn(doc) { doc.dataset })
 }
@@ -255,568 +246,118 @@ pub fn serialize_dataset_to_file(
 
 // Private functions
 
+/// Parses every line, collecting quads in file order, and builds the dataset
+/// once with `dataset.from_list` (O(n log n) deduplication). The streaming
+/// parser builds its dataset the same way, so both return equal datasets.
 fn parse_lines(
   lines: List(String),
   line_num: Int,
-  acc_dataset: dataset.Dataset,
+  acc: List(statement.Quad),
 ) -> Result(dataset.Dataset, NQuadsError) {
   case lines {
-    [] -> Ok(acc_dataset)
-    [line, ..rest] -> {
-      let trimmed = string.trim(line)
-      case trimmed {
-        "" -> parse_lines(rest, line_num + 1, acc_dataset)
-        _ ->
-          case string.starts_with(trimmed, "#") {
-            True -> parse_lines(rest, line_num + 1, acc_dataset)
-            // Skip comments
-            False ->
-              case parse_line(trimmed, line_num) {
-                Ok(quad) ->
-                  parse_lines(
-                    rest,
-                    line_num + 1,
-                    dataset.add_quad(acc_dataset, quad),
-                  )
-                Error(error) -> Error(error)
-              }
-          }
-      }
-    }
-  }
-}
-
-fn parse_line(
-  line: String,
-  line_num: Int,
-) -> Result(statement.Quad, NQuadsError) {
-  // Check for required trailing dot
-  case string.ends_with(line, " .") {
-    True -> {
-      let content = string.drop_end(line, 2)
-      case parse_quad_content(content) {
-        Ok(quad) -> Ok(quad)
+    [] -> Ok(dataset.from_list(list.reverse(acc)))
+    [line, ..rest] ->
+      case rdf_syntax.parse_statement(line, rdf_syntax.NQuads) {
+        // Blank line or comment
+        Ok(None) -> parse_lines(rest, line_num + 1, acc)
+        Ok(Some(quad)) -> parse_lines(rest, line_num + 1, [quad, ..acc])
         Error(msg) -> Error(NQuadsError(msg, line_num))
       }
-    }
-    False ->
-      case string.ends_with(line, ".") {
-        True -> {
-          let content = string.drop_end(line, 1)
-          case parse_quad_content(content) {
-            Ok(quad) -> Ok(quad)
-            Error(msg) -> Error(NQuadsError(msg, line_num))
-          }
-        }
-        False ->
-          Error(NQuadsError(
-            "N-Quads statement must end with a dot (.)",
-            line_num,
-          ))
-      }
   }
-}
-
-fn parse_quad_content(content: String) -> Result(statement.Quad, String) {
-  case parse_subject_predicate_object_graph(content) {
-    Ok(#(subject_str, predicate_str, object_str, graph_option)) -> {
-      use subject <- result.try(parse_term_as_subject(subject_str))
-      use predicate <- result.try(parse_iri_ref(predicate_str))
-      use object <- result.try(parse_term_as_object(object_str))
-
-      case graph_option {
-        Some(graph_str) ->
-          case parse_term_as_graph_name(graph_str) {
-            Ok(graph_name) ->
-              Ok(statement.Quad(
-                subject: subject,
-                predicate: predicate,
-                object: object,
-                graph: graph_name,
-              ))
-            Error(msg) -> Error(msg)
-          }
-        None ->
-          Ok(statement.Quad(
-            subject: subject,
-            predicate: predicate,
-            object: object,
-            graph: term.DefaultGraph,
-          ))
-      }
-    }
-    Error(msg) -> Error(msg)
-  }
-}
-
-fn parse_subject_predicate_object_graph(
-  content: String,
-) -> Result(#(String, String, String, Option(String)), String) {
-  // First check if there's a quoted triple in subject position
-  case string.starts_with(content, "<<(") {
-    True -> parse_with_quoted_triple_subject_nquads(content)
-    False -> {
-      // Check for quoted triple in object position  
-      case string.contains(content, "<<(") {
-        True -> parse_with_quoted_triple_object_nquads(content)
-        False -> {
-          // Regular tokenization for 3 or 4 terms
-          let parts = tokenize_quad(content)
-          case parts {
-            [subject, predicate, object] ->
-              Ok(#(subject, predicate, object, None))
-            [subject, predicate, object, graph] ->
-              Ok(#(subject, predicate, object, Some(graph)))
-            _ ->
-              Error(
-                "Expected 3 or 4 terms (subject, predicate, object, optional graph), got "
-                <> string.inspect(list.length(parts)),
-              )
-          }
-        }
-      }
-    }
-  }
-}
-
-fn parse_with_quoted_triple_subject_nquads(
-  content: String,
-) -> Result(#(String, String, String, Option(String)), String) {
-  case find_quoted_triple_end(content, 0) {
-    Some(end_pos) -> {
-      let subject = string.slice(content, 0, end_pos + 3)
-      let remaining = string.trim_start(string.drop_start(content, end_pos + 3))
-
-      let parts = tokenize_quad(remaining)
-      case parts {
-        [predicate, object] -> Ok(#(subject, predicate, object, None))
-        [predicate, object, graph] ->
-          Ok(#(subject, predicate, object, Some(graph)))
-        _ ->
-          Error(
-            "Expected predicate, object, and optional graph after quoted triple subject",
-          )
-      }
-    }
-    None -> Error("Unclosed quoted triple in subject position")
-  }
-}
-
-fn parse_with_quoted_triple_object_nquads(
-  content: String,
-) -> Result(#(String, String, String, Option(String)), String) {
-  case find_quoted_triple_start(content, 0) {
-    Some(start_pos) -> {
-      case find_quoted_triple_end(content, start_pos + 3) {
-        Some(end_pos) -> {
-          let before_quoted = string.slice(content, 0, start_pos) |> string.trim
-          let quoted_object =
-            string.slice(content, start_pos, end_pos - start_pos + 3)
-          let after_start = end_pos + 3
-          let after_length = string.length(content) - after_start
-          let after_quoted =
-            string.slice(content, after_start, after_length) |> string.trim
-
-          // Parse the part before the quoted triple to get subject and predicate
-          let before_parts = tokenize_quad(before_quoted)
-          case before_parts {
-            [subject, predicate] -> {
-              // Check if there's a graph after the quoted object
-              case string.is_empty(after_quoted) {
-                True -> Ok(#(subject, predicate, quoted_object, None))
-                False -> {
-                  let after_parts = tokenize_quad(after_quoted)
-                  case after_parts {
-                    [graph] ->
-                      Ok(#(subject, predicate, quoted_object, Some(graph)))
-                    _ ->
-                      Error(
-                        "Expected single graph label after quoted triple object",
-                      )
-                  }
-                }
-              }
-            }
-            _ ->
-              Error(
-                "Expected subject and predicate before quoted triple object",
-              )
-          }
-        }
-        None -> Error("Unclosed quoted triple in object position")
-      }
-    }
-    None -> Error("Quoted triple not found in object position")
-  }
-}
-
-// Reuse helper functions from ntriples module with slight modifications for quad tokenization
-fn tokenize_quad(content: String) -> List(String) {
-  // For now, use simple whitespace splitting since N-Quads has simpler tokenization
-  // compared to complex RDF-star cases handled in ntriples
-  content
-  |> string.split(" ")
-  |> list.filter(fn(token) { !string.is_empty(token) })
-}
-
-fn find_quoted_triple_start(text: String, pos: Int) -> Option(Int) {
-  case string.slice(text, pos, 3) {
-    "<<(" -> Some(pos)
-    _ ->
-      case pos >= string.length(text) - 3 {
-        True -> None
-        False -> find_quoted_triple_start(text, pos + 1)
-      }
-  }
-}
-
-fn find_quoted_triple_end(text: String, pos: Int) -> Option(Int) {
-  case string.slice(text, pos, 3) {
-    ")>>" -> Some(pos)
-    _ ->
-      case pos >= string.length(text) - 3 {
-        True -> None
-        False -> find_quoted_triple_end(text, pos + 1)
-      }
-  }
-}
-
-// Simplified term parsing - reimplement key functions locally for now
-fn parse_term_as_subject(term_str: String) -> Result(term.Subject, String) {
-  case parse_simple_term(term_str) {
-    Ok(term_value) ->
-      term.subject_from_term(term_value)
-      |> result.map_error(fn(_) { "Invalid subject term" })
-    Error(msg) -> Error(msg)
-  }
-}
-
-fn parse_term_as_object(term_str: String) -> Result(term.Object, String) {
-  case parse_simple_term(term_str) {
-    Ok(term_value) -> Ok(term.object_from_term(term_value))
-    Error(msg) -> Error(msg)
-  }
-}
-
-fn parse_term_as_graph_name(term_str: String) -> Result(term.GraphName, String) {
-  case parse_simple_term(term_str) {
-    Ok(term_value) ->
-      term.graph_name_from_term(term_value)
-      |> result.map_error(fn(_) { "Invalid graph name term" })
-    Error(msg) -> Error(msg)
-  }
-}
-
-fn parse_iri_ref(iri_str: String) -> Result(term.NamedNode, String) {
-  case parse_simple_term(iri_str) {
-    Ok(term.NamedTerm(node)) -> Ok(node)
-    Ok(_) -> Error("Predicate must be an IRI")
-    Error(msg) -> Error(msg)
-  }
-}
-
-// Simple term parsing (basic implementation for N-Quads)
-fn parse_simple_term(term_str: String) -> Result(term.Term, String) {
-  let trimmed = string.trim(term_str)
-  case string.starts_with(trimmed, "<") && string.ends_with(trimmed, ">") {
-    True -> {
-      let iri_content =
-        trimmed
-        |> string.drop_start(1)
-        |> string.drop_end(1)
-
-      case term.named_node(iri_content) {
-        Ok(node) -> Ok(term.NamedTerm(node))
-        Error(_) -> Error("Invalid IRI: " <> iri_content)
-      }
-    }
-    False -> {
-      case string.starts_with(trimmed, "_:") {
-        True -> {
-          let identifier = string.drop_start(trimmed, 2)
-          case term.blank_node(identifier) {
-            Ok(node) -> Ok(term.BlankTerm(node))
-            Error(_) -> Error("Invalid blank node identifier: " <> identifier)
-          }
-        }
-        False -> {
-          case string.starts_with(trimmed, "\"") {
-            True -> parse_simple_literal(trimmed)
-            False -> Error("Unsupported term format: " <> term_str)
-          }
-        }
-      }
-    }
-  }
-}
-
-fn parse_simple_literal(literal_str: String) -> Result(term.Term, String) {
-  case find_closing_quote(literal_str, 1) {
-    Some(end_pos) -> {
-      let value = string.slice(literal_str, 1, end_pos - 1)
-      let remainder = string.drop_start(literal_str, end_pos + 1) |> string.trim
-
-      case remainder {
-        "" -> Ok(term.LiteralTerm(term.simple_literal(value)))
-        _ -> {
-          case string.starts_with(remainder, "^^") {
-            True -> {
-              let datatype_str = string.drop_start(remainder, 2)
-              case parse_simple_term(datatype_str) {
-                Ok(term.NamedTerm(datatype)) ->
-                  Ok(term.LiteralTerm(term.typed_literal(value, datatype)))
-                Ok(_) -> Error("Datatype must be an IRI")
-                Error(msg) -> Error("Invalid datatype: " <> msg)
-              }
-            }
-            False -> {
-              case string.starts_with(remainder, "@") {
-                True -> {
-                  let lang_str = string.drop_start(remainder, 1)
-                  case term.language_tag(lang_str) {
-                    Ok(lang_tag) ->
-                      Ok(
-                        term.LiteralTerm(term.language_literal(value, lang_tag)),
-                      )
-                    Error(_) -> Error("Invalid language tag: " <> lang_str)
-                  }
-                }
-                False -> Error("Invalid literal format: " <> literal_str)
-              }
-            }
-          }
-        }
-      }
-    }
-    None -> Error("Unterminated string literal: " <> literal_str)
-  }
-}
-
-fn find_closing_quote(text: String, pos: Int) -> Option(Int) {
-  case string.slice(text, pos, 1) {
-    "\"" -> Some(pos)
-    "\\" -> find_closing_quote(text, pos + 2)
-    // Skip escaped character
-    "" -> None
-    _ -> find_closing_quote(text, pos + 1)
-  }
-}
-
-// Serialization functions
-fn serialize_triple_to_nquads(triple: statement.Triple) -> String {
-  let statement.Triple(subject: subject, predicate: predicate, object: object) =
-    triple
-  serialize_subject(subject)
-  <> " "
-  <> serialize_predicate(predicate)
-  <> " "
-  <> serialize_object(object)
-  <> " ."
-}
-
-fn serialize_quad_to_nquads(
-  triple: statement.Triple,
-  graph_name: term.GraphName,
-) -> String {
-  let statement.Triple(subject: subject, predicate: predicate, object: object) =
-    triple
-  serialize_subject(subject)
-  <> " "
-  <> serialize_predicate(predicate)
-  <> " "
-  <> serialize_object(object)
-  <> " "
-  <> serialize_graph_name(graph_name)
-  <> " ."
-}
-
-fn serialize_subject(subject: term.Subject) -> String {
-  case subject {
-    term.SubjectNamed(node) -> serialize_named_node(node)
-    term.SubjectBlank(node) -> serialize_blank_node(node)
-    term.SubjectTriple(_) -> "<<quoted-triples-not-implemented>>"
-    // TODO: RDF-star
-  }
-}
-
-fn serialize_predicate(predicate: term.Predicate) -> String {
-  serialize_named_node(predicate)
-}
-
-fn serialize_object(object: term.Object) -> String {
-  case object {
-    term.ObjectNamed(node) -> serialize_named_node(node)
-    term.ObjectBlank(node) -> serialize_blank_node(node)
-    term.ObjectLiteral(literal) -> serialize_literal(literal)
-    term.ObjectTriple(_) -> "<<quoted-triples-not-implemented>>"
-    // TODO: RDF-star
-  }
-}
-
-fn serialize_named_node(node: term.NamedNode) -> String {
-  let term.NamedNode(iri) = node
-  "<" <> iri <> ">"
-}
-
-fn serialize_blank_node(node: term.BlankNode) -> String {
-  let term.BlankNode(id) = node
-  "_:" <> id
-}
-
-fn serialize_literal(literal: term.Literal) -> String {
-  case literal {
-    term.SimpleLiteral(value) -> "\"" <> escape_string(value) <> "\""
-    term.LanguageTaggedLiteral(value, tag) -> {
-      let term.LanguageTag(lang) = tag
-      "\"" <> escape_string(value) <> "\"@" <> lang
-    }
-    term.TypedLiteral(value, datatype) ->
-      "\"" <> escape_string(value) <> "\"^^" <> serialize_named_node(datatype)
-  }
-}
-
-fn serialize_graph_name(graph_name: term.GraphName) -> String {
-  case graph_name {
-    term.DefaultGraph -> ""
-    // This shouldn't happen in named graph context
-    term.NamedGraph(node) -> serialize_named_node(node)
-    term.BlankGraph(node) -> serialize_blank_node(node)
-  }
-}
-
-fn escape_string(value: String) -> String {
-  value
-  |> string.replace("\\", "\\\\")
-  |> string.replace("\"", "\\\"")
-  |> string.replace("\n", "\\n")
-  |> string.replace("\r", "\\r")
-  |> string.replace("\t", "\\t")
 }
 
 // Streaming Operations
 
-/// Stream parse N-Quads from a file line by line.
+/// Fold over the quads of an N-Quads file without holding the file or the
+/// quads in memory.
 ///
-/// This function reads the file line by line without loading the entire
-/// file into memory, making it suitable for processing very large N-Quads
-/// files. Each line is parsed as it's read and added to the dataset.
+/// The file is read one line at a time and `f` is called with each quad in
+/// file order (duplicates included). Statements without a graph label are in
+/// `term.DefaultGraph`. Only the current line and your accumulator are kept,
+/// so memory use stays constant regardless of file size. Works on both the
+/// Erlang and JavaScript targets.
+///
+/// Errors use the same `NQuadsError` as `parse_file`: a syntax error has the
+/// same message and line number, and file errors (open, read, close) have a
+/// `"File error: ..."` message. Invalid UTF-8 is reported with the number of
+/// the offending line.
+///
+/// ## Examples
+/// ```gleam
+/// // Count the quads in named graphs in constant memory
+/// let count_named = fn(count, quad: statement.Quad) {
+///   case quad.graph {
+///     term.DefaultGraph -> count
+///     _ -> count + 1
+///   }
+/// }
+/// case nquads.streaming_fold_file("large.nq", from: 0, with: count_named) {
+///   Ok(count) -> io.println(int.to_string(count) <> " quads in named graphs")
+///   Error(nquads.NQuadsError(message, line)) ->
+///     io.println(message <> " at line " <> int.to_string(line))
+/// }
+/// ```
+pub fn streaming_fold_file(
+  path: String,
+  from initial: acc,
+  with f: fn(acc, statement.Quad) -> acc,
+) -> Result(acc, NQuadsError) {
+  streaming.fold_statements(path, rdf_syntax.NQuads, initial, NQuadsError, f)
+}
+
+/// Parse an N-Quads file by reading it line by line.
+///
+/// The file text is never loaded as a whole: each line is read and parsed in
+/// turn, which works on both the Erlang and JavaScript targets. The resulting
+/// dataset is still held in memory, so memory use grows with the number of
+/// quads. To process a file in constant memory, use `streaming_fold_file`.
+///
+/// The result is equal (`==`) to what `parse_file` returns for the same file,
+/// and errors are the same `NQuadsError` values (see `streaming_fold_file`).
 ///
 /// ## Examples
 /// ```gleam
 /// case nquads.streaming_parse_file("large_dataset.nq") {
-///   Ok(document) -> {
-///     io.println("Successfully parsed large dataset")
-///   }
-///   Error(file_stream_error.Enoent) -> io.println("File not found")
-///   // ... other file errors
+///   Ok(document) ->
+///     io.println(
+///       int.to_string(dataset.quad_count(document.dataset)) <> " quads",
+///     )
+///   Error(nquads.NQuadsError(message, line)) ->
+///     io.println(message <> " at line " <> int.to_string(line))
 /// }
 /// ```
 pub fn streaming_parse_file(
-  filename: String,
-) -> Result(NQuadsDocument, file_stream_error.FileStreamError) {
-  use stream <- result.try(file_stream.open_read(filename))
-  let result = streaming_parse_from_stream(stream)
-  // Always try to close the stream
-  let _ = file_stream.close(stream)
-  case result {
-    Ok(document) -> Ok(document)
-    Error(_) -> Error(file_stream_error.Eio)
-    // Generic I/O error for parse failures
-  }
+  path: String,
+) -> Result(NQuadsDocument, NQuadsError) {
+  streaming_fold_file(path, from: [], with: fn(acc, quad) { [quad, ..acc] })
+  |> result.map(fn(quads) {
+    NQuadsDocument(dataset: dataset.from_list(list.reverse(quads)))
+  })
 }
 
-/// Stream serialize N-Quads dataset to a file line by line.
+/// Serialize an RDF dataset to an N-Quads file, writing it in batches of
+/// lines instead of building the whole document as one string first.
 ///
-/// This function writes quads to the file one by one without building
-/// the entire serialized content in memory first, making it suitable for
-/// serializing very large datasets.
+/// The output is byte-for-byte the same as `serialize_dataset`. The file is
+/// created or truncated. Errors from writing and from closing the file (where
+/// buffered write failures such as a full disk are reported) are returned as
+/// an `NQuadsError` with a `"File error: ..."` message and line 0.
 ///
 /// ## Examples
 /// ```gleam
-/// let my_dataset = dataset.new()
-///   |> dataset.add(statement.Quad(...))
-///   
 /// case nquads.streaming_serialize_to_file(my_dataset, "output.nq") {
-///   Ok(Nil) -> io.println("Dataset successfully written to file")
-///   Error(file_stream_error.Eacces) -> io.println("Permission denied")
-///   // ... other file errors
+///   Ok(Nil) -> io.println("Dataset written")
+///   Error(nquads.NQuadsError(message, _)) -> io.println(message)
 /// }
 /// ```
 pub fn streaming_serialize_to_file(
-  dataset: dataset.Dataset,
-  filename: String,
-) -> Result(Nil, file_stream_error.FileStreamError) {
-  use stream <- result.try(file_stream.open_write(filename))
-  let result = streaming_serialize_dataset_to_stream(dataset, stream)
-  // Always try to close the stream
-  let _ = file_stream.close(stream)
-  result
-}
-
-// Internal streaming helper functions
-
-fn streaming_parse_from_stream(
-  stream: file_stream.FileStream,
-) -> Result(NQuadsDocument, NQuadsError) {
-  let empty_dataset = dataset.new()
-  streaming_parse_lines(stream, empty_dataset, 1)
-}
-
-fn streaming_parse_lines(
-  stream: file_stream.FileStream,
-  acc_dataset: dataset.Dataset,
-  line_number: Int,
-) -> Result(NQuadsDocument, NQuadsError) {
-  case file_stream.read_line(stream) {
-    Ok(line) -> {
-      let trimmed_line = string.trim(line)
-      case trimmed_line {
-        // Skip empty lines and comments
-        "" | "#" <> _ ->
-          streaming_parse_lines(stream, acc_dataset, line_number + 1)
-        _ -> {
-          case parse_line(trimmed_line, line_number) {
-            Ok(quad) -> {
-              let updated_dataset = dataset.add_quad(acc_dataset, quad)
-              streaming_parse_lines(stream, updated_dataset, line_number + 1)
-            }
-            Error(err) -> Error(err)
-          }
-        }
-      }
-    }
-    Error(file_stream_error.Eof) -> {
-      // End of file - return the accumulated dataset
-      Ok(NQuadsDocument(dataset: acc_dataset))
-    }
-    Error(_) -> {
-      Error(NQuadsError("Failed to read line from stream", line_number))
-    }
-  }
-}
-
-fn streaming_serialize_dataset_to_stream(
-  dataset: dataset.Dataset,
-  stream: file_stream.FileStream,
-) -> Result(Nil, file_stream_error.FileStreamError) {
-  let quads_list = dataset.quads
-  streaming_write_quads(quads_list, stream)
-}
-
-fn streaming_write_quads(
-  quads_list: List(statement.Quad),
-  stream: file_stream.FileStream,
-) -> Result(Nil, file_stream_error.FileStreamError) {
-  case quads_list {
-    [] -> Ok(Nil)
-    [quad, ..rest] -> {
-      let statement.Quad(subject: s, predicate: p, object: o, graph: g) = quad
-      let triple = statement.Triple(subject: s, predicate: p, object: o)
-      let line = serialize_quad_to_nquads(triple, g) <> "\n"
-      case file_stream.write_chars(stream, line) {
-        Ok(_) -> streaming_write_quads(rest, stream)
-        Error(err) -> Error(err)
-      }
-    }
-  }
+  ds: dataset.Dataset,
+  path: String,
+) -> Result(Nil, NQuadsError) {
+  streaming.write_lines(
+    path,
+    dataset.quads(ds),
+    rdf_syntax.serialize_quad,
+    NQuadsError,
+  )
 }

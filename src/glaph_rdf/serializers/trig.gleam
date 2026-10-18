@@ -4,6 +4,7 @@
 
 import glaph_rdf/dataset
 import glaph_rdf/graph
+import glaph_rdf/internal/utf8
 import glaph_rdf/statement
 import glaph_rdf/term
 import gleam/dict
@@ -227,7 +228,7 @@ pub fn serialize_dataset(
 /// }
 /// ```
 pub fn parse_file(path: String) -> Result(TrigDocument, TrigError) {
-  case simplifile.read(path) {
+  case utf8.read_file(path) {
     Ok(contents) -> parse(contents)
     Error(error) -> {
       let error_msg = case error {
@@ -525,18 +526,25 @@ fn find_prefix(
     dict.to_list(prefixes)
     |> list.fold(None, fn(current, entry) {
       let #(name, ns) = entry
-      case string.starts_with(iri, ns) {
-        True -> {
-          let local = string.drop_start(iri, string.length(ns))
-          case current {
-            None -> Some(#(name, local, string.length(ns)))
-            Some(#(best_name, best_local, best_len)) ->
-              case string.length(ns) > best_len {
-                True -> Some(#(name, local, string.length(ns)))
-                False -> Some(#(best_name, best_local, best_len))
+      // Strip the namespace with split_once rather than string.drop_start:
+      // on the JavaScript target drop_start mixes UTF-8 byte and UTF-16 unit
+      // offsets, which corrupts the local name for non-ASCII namespaces.
+      case ns != "" && string.starts_with(iri, ns) {
+        True ->
+          case string.split_once(iri, ns) {
+            Ok(#("", local)) -> {
+              let ns_len = string.length(ns)
+              case current {
+                None -> Some(#(name, local, ns_len))
+                Some(#(best_name, best_local, best_len)) ->
+                  case ns_len > best_len {
+                    True -> Some(#(name, local, ns_len))
+                    False -> Some(#(best_name, best_local, best_len))
+                  }
               }
+            }
+            _ -> current
           }
-        }
         False -> current
       }
     })

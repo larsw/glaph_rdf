@@ -5,6 +5,7 @@ import gleam/int
 import gleam/list
 import gleam/order
 import gleam/result
+import gleam/set
 import gleam/string
 
 /// An RDF graph containing a collection of RDF triples.
@@ -40,7 +41,11 @@ pub fn new() -> Graph {
 ///
 /// Constructs a graph from the provided list of triples, automatically
 /// removing any duplicates to maintain the mathematical properties of
-/// RDF graphs as sets.
+/// RDF graphs as sets. The first occurrence of each triple is kept and the
+/// input order is preserved.
+///
+/// This is the preferred way to build a graph from many triples: it runs in
+/// O(n log n), whereas folding `add` over a list is O(n²).
 ///
 /// ## Examples
 /// ```gleam
@@ -153,7 +158,8 @@ pub fn remove(graph: Graph, triple: statement.Triple) -> Graph {
 /// Combines all triples from both graphs into a single graph, automatically
 /// handling deduplication. This implements the mathematical union of two
 /// sets of triples. The order of arguments determines which graph receives
-/// the new triples.
+/// the new triples. The result is the same as folding `add` over the triples
+/// of `other`, but runs in O((n + m) log(n + m)).
 ///
 /// ## Examples
 /// ```gleam
@@ -166,7 +172,11 @@ pub fn remove(graph: Graph, triple: statement.Triple) -> Graph {
 ///   |> graph.merge(from: graph2)
 /// ```
 pub fn merge(into graph: Graph, from other: Graph) -> Graph {
-  list.fold(other.triples, graph, fn(acc, triple) { add(acc, triple) })
+  Graph(triples: prepend_new(
+    graph.triples,
+    set.from_list(graph.triples),
+    other.triples,
+  ))
 }
 
 /// Check if two RDF graphs are isomorphic (logically equivalent).
@@ -255,20 +265,7 @@ fn extract_blank_nodes(graph: Graph) -> List(term.BlankNode) {
 }
 
 fn dedupe_blank_nodes(blanks: List(term.BlankNode)) -> List(term.BlankNode) {
-  list.reverse(
-    list.fold(blanks, [], fn(acc, blank) {
-      case list.any(acc, fn(existing) { blank_nodes_equal(existing, blank) }) {
-        True -> acc
-        False -> [blank, ..acc]
-      }
-    }),
-  )
-}
-
-fn blank_nodes_equal(blank1: term.BlankNode, blank2: term.BlankNode) -> Bool {
-  let term.BlankNode(id1) = blank1
-  let term.BlankNode(id2) = blank2
-  id1 == id2
+  dedupe(blanks)
 }
 
 fn create_canonical_mapping(
@@ -296,7 +293,10 @@ fn create_blank_node_signatures(
   })
 }
 
-fn calculate_blank_node_signature(graph: Graph, blank: term.BlankNode) -> String {
+fn calculate_blank_node_signature(
+  graph: Graph,
+  blank: term.BlankNode,
+) -> String {
   let term.BlankNode(blank_id) = blank
 
   let relevant_triples =
@@ -333,7 +333,10 @@ fn triple_contains_blank_node(
   subject_matches || object_matches
 }
 
-fn create_triple_signature(triple: statement.Triple, blank_id: String) -> String {
+fn create_triple_signature(
+  triple: statement.Triple,
+  blank_id: String,
+) -> String {
   let statement.Triple(subject, predicate, object) = triple
   let term.NamedNode(pred_iri) = predicate
 
@@ -486,13 +489,23 @@ fn serialize_object_internal(object: term.Object) -> String {
   }
 }
 
-fn dedupe(triples: List(statement.Triple)) -> List(statement.Triple) {
-  list.reverse(
-    list.fold(triples, [], fn(acc, triple) {
-      case list.any(acc, fn(existing) { existing == triple }) {
-        True -> acc
-        False -> [triple, ..acc]
+/// Remove duplicates in O(n log n), keeping the first occurrence of each item
+/// and the original order.
+fn dedupe(items: List(a)) -> List(a) {
+  list.reverse(prepend_new([], set.new(), items))
+}
+
+/// Prepend, in reverse order, every item of `items` that is not in `seen` and
+/// has not been prepended already. This is exactly what folding a
+/// prepend-if-absent `add` over `items` does, but with set lookups instead of
+/// list scans.
+fn prepend_new(acc: List(a), seen: set.Set(a), items: List(a)) -> List(a) {
+  case items {
+    [] -> acc
+    [item, ..rest] ->
+      case set.contains(seen, item) {
+        True -> prepend_new(acc, seen, rest)
+        False -> prepend_new([item, ..acc], set.insert(seen, item), rest)
       }
-    }),
-  )
+  }
 }

@@ -4,7 +4,7 @@ import glaph_rdf/term
 import gleam/int
 import gleam/list
 import gleam/order
-
+import gleam/set
 import gleam/string
 
 /// An RDF dataset containing multiple named graphs and a default graph.
@@ -41,7 +41,11 @@ pub fn new() -> Dataset {
 ///
 /// Constructs a dataset from the provided list of quads, automatically
 /// removing any duplicates to maintain the mathematical properties of
-/// RDF datasets as sets of quads.
+/// RDF datasets as sets of quads. The first occurrence of each quad is kept
+/// and the input order is preserved.
+///
+/// This is the preferred way to build a dataset from many quads: it runs in
+/// O(n log n), whereas folding `add_quad` over a list is O(n²).
 ///
 /// ## Examples
 /// ```gleam
@@ -248,6 +252,8 @@ pub fn graph(dataset: Dataset, name: term.GraphName) -> graph.Graph {
 /// Combines all quads from both datasets into a single dataset, automatically
 /// handling deduplication. This implements the mathematical union of two
 /// sets of quads, preserving all named graphs and the default graph.
+/// The result is the same as folding `add_quad` over the quads of `other`,
+/// but runs in O((n + m) log(n + m)).
 ///
 /// ## Examples
 /// ```gleam
@@ -260,7 +266,11 @@ pub fn graph(dataset: Dataset, name: term.GraphName) -> graph.Graph {
 ///   |> dataset.merge(from: dataset2)
 /// ```
 pub fn merge(into dataset: Dataset, from other: Dataset) -> Dataset {
-  list.fold(other.quads, dataset, fn(acc, quad) { add_quad(acc, quad) })
+  Dataset(quads: prepend_new(
+    dataset.quads,
+    set.from_list(dataset.quads),
+    other.quads,
+  ))
 }
 
 /// Replace or add a named graph in an RDF dataset.
@@ -291,10 +301,16 @@ pub fn replace_graph(
   new_graph: graph.Graph,
 ) -> Dataset {
   let stripped = remove_graph(dataset, name)
+  let new_quads =
+    list.map(graph.triples(new_graph), fn(triple) {
+      statement.quad(triple, name)
+    })
 
-  list.fold(graph.triples(new_graph), stripped, fn(acc, triple) {
-    add_quad(acc, statement.quad(triple, name))
-  })
+  Dataset(quads: prepend_new(
+    stripped.quads,
+    set.from_list(stripped.quads),
+    new_quads,
+  ))
 }
 
 /// Get all named graph identifiers from an RDF dataset.
@@ -320,15 +336,25 @@ pub fn graph_names(dataset: Dataset) -> List(term.GraphName) {
   |> dedupe_graph_names
 }
 
-fn dedupe(quads: List(statement.Quad)) -> List(statement.Quad) {
-  list.reverse(
-    list.fold(quads, [], fn(acc, quad) {
-      case list.any(acc, fn(existing) { existing == quad }) {
-        True -> acc
-        False -> [quad, ..acc]
+/// Remove duplicates in O(n log n), keeping the first occurrence of each item
+/// and the original order.
+fn dedupe(items: List(a)) -> List(a) {
+  list.reverse(prepend_new([], set.new(), items))
+}
+
+/// Prepend, in reverse order, every item of `items` that is not in `seen` and
+/// has not been prepended already. This is exactly what folding a
+/// prepend-if-absent `add_quad` over `items` does, but with set lookups
+/// instead of list scans.
+fn prepend_new(acc: List(a), seen: set.Set(a), items: List(a)) -> List(a) {
+  case items {
+    [] -> acc
+    [item, ..rest] ->
+      case set.contains(seen, item) {
+        True -> prepend_new(acc, seen, rest)
+        False -> prepend_new([item, ..acc], set.insert(seen, item), rest)
       }
-    }),
-  )
+  }
 }
 
 /// Check if two RDF datasets are isomorphic (logically equivalent).
@@ -438,7 +464,9 @@ fn named_graphs_isomorphic(
   }
 }
 
-fn canonicalize_graph_names(names: List(term.GraphName)) -> List(term.GraphName) {
+fn canonicalize_graph_names(
+  names: List(term.GraphName),
+) -> List(term.GraphName) {
   // Extract blank graph names for canonicalization
   let blank_names =
     list.filter_map(names, fn(name) {
@@ -499,8 +527,8 @@ fn compare_graph_names(
     _, term.DefaultGraph -> order.Gt
     term.NamedGraph(term.NamedNode(iri1)), term.NamedGraph(term.NamedNode(iri2))
     -> string.compare(iri1, iri2)
-    term.BlankGraph(term.BlankNode(id1)), term.BlankGraph(term.BlankNode(id2)) ->
-      string.compare(id1, id2)
+    term.BlankGraph(term.BlankNode(id1)), term.BlankGraph(term.BlankNode(id2))
+    -> string.compare(id1, id2)
     term.NamedGraph(_), term.BlankGraph(_) -> order.Lt
     term.BlankGraph(_), term.NamedGraph(_) -> order.Gt
   }
@@ -546,12 +574,5 @@ fn canonicalize_quad(quad: statement.Quad) -> statement.Quad {
 }
 
 fn dedupe_graph_names(names: List(term.GraphName)) -> List(term.GraphName) {
-  list.reverse(
-    list.fold(names, [], fn(acc, name) {
-      case list.any(acc, fn(existing) { existing == name }) {
-        True -> acc
-        False -> [name, ..acc]
-      }
-    }),
-  )
+  dedupe(names)
 }

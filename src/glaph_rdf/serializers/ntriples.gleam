@@ -5,14 +5,13 @@
 //// This makes it ideal for large-scale data processing and streaming applications.
 //// Supports RDF-star quoted triples with `<<( ... )>>` syntax.
 
-import file_streams/file_stream
-import file_streams/file_stream_error
 import glaph_rdf/graph
+import glaph_rdf/internal/rdf_syntax
+import glaph_rdf/internal/streaming
+import glaph_rdf/internal/utf8
 import glaph_rdf/statement
-import glaph_rdf/term
-
 import gleam/list
-import gleam/option.{type Option, None, Some}
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
 import simplifile
@@ -57,8 +56,8 @@ pub type NTriplesDocument {
 /// }
 /// ```
 pub fn parse(text: String) -> Result(NTriplesDocument, NTriplesError) {
-  let lines = string.split(text, "\n")
-  parse_lines(lines, 1, graph.new())
+  let lines = rdf_syntax.split_lines(text)
+  parse_lines(lines, 1, [])
   |> result.map(NTriplesDocument)
 }
 
@@ -113,7 +112,7 @@ pub fn serialize(document: NTriplesDocument) -> String {
 /// ```
 pub fn serialize_graph(rdf_graph: graph.Graph) -> String {
   graph.triples(rdf_graph)
-  |> list.map(serialize_triple)
+  |> list.map(rdf_syntax.serialize_triple)
   |> string.join("\n")
   |> fn(content) {
     case string.is_empty(content) {
@@ -141,7 +140,7 @@ pub fn serialize_graph(rdf_graph: graph.Graph) -> String {
 /// }
 /// ```
 pub fn parse_file(path: String) -> Result(NTriplesDocument, NTriplesError) {
-  case simplifile.read(path) {
+  case utf8.read_file(path) {
     Ok(contents) -> parse(contents)
     Error(error) -> {
       let error_msg = case error {
@@ -232,710 +231,121 @@ pub fn serialize_graph_to_file(
 
 // Internal parsing functions
 
+/// Parses every line, collecting triples in file order, and builds the graph
+/// once with `graph.from_list` (O(n log n) deduplication). The streaming
+/// parser builds its graph the same way, so both return equal graphs.
 fn parse_lines(
   lines: List(String),
   line_num: Int,
-  acc_graph: graph.Graph,
+  acc: List(statement.Triple),
 ) -> Result(graph.Graph, NTriplesError) {
   case lines {
-    [] -> Ok(acc_graph)
-    [line, ..rest] -> {
-      let trimmed = string.trim(line)
-      case trimmed {
-        "" -> parse_lines(rest, line_num + 1, acc_graph)
-        _ ->
-          case parse_line(trimmed, line_num) {
-            Ok(triple) ->
-              parse_lines(rest, line_num + 1, graph.add(acc_graph, triple))
-            Error(error) -> Error(error)
-          }
-      }
-    }
-  }
-}
-
-fn parse_line(
-  line: String,
-  line_num: Int,
-) -> Result(statement.Triple, NTriplesError) {
-  // Check for required trailing dot
-  case string.ends_with(line, " .") {
-    True -> {
-      let content = string.drop_end(line, 2)
-      case parse_triple_content(content) {
-        Ok(triple) -> Ok(triple)
+    [] -> Ok(graph.from_list(list.reverse(acc)))
+    [line, ..rest] ->
+      case rdf_syntax.parse_statement(line, rdf_syntax.NTriples) {
+        // Blank line or comment
+        Ok(None) -> parse_lines(rest, line_num + 1, acc)
+        Ok(Some(quad)) ->
+          parse_lines(rest, line_num + 1, [
+            statement.triple_from_quad(quad),
+            ..acc
+          ])
         Error(msg) -> Error(NTriplesError(msg, line_num))
       }
-    }
-    False ->
-      case string.ends_with(line, ".") {
-        True -> {
-          let content = string.drop_end(line, 1)
-          case parse_triple_content(content) {
-            Ok(triple) -> Ok(triple)
-            Error(msg) -> Error(NTriplesError(msg, line_num))
-          }
-        }
-        False ->
-          Error(NTriplesError(
-            "N-Triples statement must end with a dot (.)",
-            line_num,
-          ))
-      }
   }
-}
-
-fn parse_triple_content(content: String) -> Result(statement.Triple, String) {
-  case parse_subject_predicate_object(content) {
-    Ok(#(subject_str, predicate_str, object_str)) -> {
-      use subject <- result.try(parse_term_as_subject(subject_str))
-      use predicate <- result.try(parse_iri_ref(predicate_str))
-      use object <- result.try(parse_term_as_object(object_str))
-
-      Ok(statement.Triple(
-        subject: subject,
-        predicate: predicate,
-        object: object,
-      ))
-    }
-    Error(msg) -> Error(msg)
-  }
-}
-
-fn parse_subject_predicate_object(
-  content: String,
-) -> Result(#(String, String, String), String) {
-  // Handle RDF-star quoted triples in subject position
-  case string.starts_with(content, "<<(") {
-    True -> parse_with_quoted_triple_subject(content)
-    False -> {
-      // Check for quoted triple in object position
-      case string.contains(content, "<<(") {
-        True -> parse_with_quoted_triple_object(content)
-        False -> {
-          let parts = tokenize_triple(content)
-          case parts {
-            [subject, predicate, object] -> Ok(#(subject, predicate, object))
-            _ ->
-              Error(
-                "Expected exactly three terms (subject, predicate, object), got "
-                <> string.inspect(list.length(parts)),
-              )
-          }
-        }
-      }
-    }
-  }
-}
-
-fn parse_with_quoted_triple_subject(
-  content: String,
-) -> Result(#(String, String, String), String) {
-  case find_quoted_triple_end(content, 0) {
-    Some(end_pos) -> {
-      let subject = string.slice(content, 0, end_pos + 3)
-      let remaining = string.trim_start(string.drop_start(content, end_pos + 3))
-
-      let parts = tokenize_triple(remaining)
-      case parts {
-        [predicate, object] -> Ok(#(subject, predicate, object))
-        _ -> Error("Expected predicate and object after quoted triple subject")
-      }
-    }
-    None -> Error("Unclosed quoted triple in subject position")
-  }
-}
-
-fn parse_with_quoted_triple_object(
-  content: String,
-) -> Result(#(String, String, String), String) {
-  // Find where the quoted triple starts
-  case find_quoted_triple_start(content, 0) {
-    Some(start_pos) -> {
-      // Find where the quoted triple ends
-      case find_quoted_triple_end(content, start_pos + 3) {
-        Some(end_pos) -> {
-          let before_quoted = string.slice(content, 0, start_pos) |> string.trim
-          let quoted_object =
-            string.slice(content, start_pos, end_pos - start_pos + 3)
-
-          // Parse the part before the quoted triple to get subject and predicate
-          let parts = tokenize_triple(before_quoted)
-          case parts {
-            [subject, predicate] -> Ok(#(subject, predicate, quoted_object))
-            _ ->
-              Error(
-                "Expected subject and predicate before quoted triple object",
-              )
-          }
-        }
-        None -> Error("Unclosed quoted triple in object position")
-      }
-    }
-    None -> Error("Quoted triple not found in object position")
-  }
-}
-
-fn find_quoted_triple_start(text: String, pos: Int) -> Option(Int) {
-  case string.slice(text, pos, 3) {
-    "<<(" -> Some(pos)
-    _ ->
-      case pos >= string.length(text) - 3 {
-        True -> None
-        False -> find_quoted_triple_start(text, pos + 1)
-      }
-  }
-}
-
-fn find_quoted_triple_end(text: String, pos: Int) -> Option(Int) {
-  case string.slice(text, pos, 3) {
-    ")>>" -> Some(pos)
-    _ ->
-      case pos >= string.length(text) - 3 {
-        True -> None
-        False -> find_quoted_triple_end(text, pos + 1)
-      }
-  }
-}
-
-fn tokenize_triple(content: String) -> List(String) {
-  tokenize_loop(string.to_graphemes(content), [], "", False, False, 0)
-  |> list.reverse
-  |> list.filter(fn(token) { !string.is_empty(token) })
-}
-
-fn tokenize_loop(
-  chars: List(String),
-  tokens: List(String),
-  current: String,
-  in_iri: Bool,
-  in_literal: Bool,
-  quote_depth: Int,
-) -> List(String) {
-  case chars {
-    [] -> {
-      case string.is_empty(current) {
-        True -> tokens
-        False -> [current, ..tokens]
-      }
-    }
-    [char, ..rest] -> {
-      case char, in_iri, in_literal, quote_depth {
-        "<", False, False, 0 -> {
-          // Check for quoted triple start
-          case string.join([char, ..list.take(rest, 3)], "") {
-            "<<(" ->
-              tokenize_loop(rest, tokens, current <> char, False, False, 1)
-            _ ->
-              tokenize_loop(
-                rest,
-                tokens,
-                current <> char,
-                True,
-                False,
-                quote_depth,
-              )
-          }
-        }
-        ">", True, False, 0 ->
-          tokenize_loop(
-            rest,
-            [current <> char, ..tokens],
-            "",
-            False,
-            False,
-            quote_depth,
-          )
-        ")", False, False, _ if quote_depth > 0 -> {
-          // Check for quoted triple end
-          case string.join([char, ..list.take(rest, 2)], "") {
-            ")>>" ->
-              tokenize_loop(
-                list.drop(rest, 2),
-                [current <> ")>>", ..tokens],
-                "",
-                False,
-                False,
-                quote_depth - 1,
-              )
-            _ ->
-              tokenize_loop(
-                rest,
-                tokens,
-                current <> char,
-                in_iri,
-                in_literal,
-                quote_depth,
-              )
-          }
-        }
-        "\"", False, False, _ ->
-          tokenize_loop(rest, tokens, current <> char, False, True, quote_depth)
-        "\"", False, True, _ ->
-          tokenize_loop(
-            rest,
-            tokens,
-            current <> char,
-            False,
-            False,
-            quote_depth,
-          )
-        " ", False, False, 0 -> {
-          case string.is_empty(current) {
-            True ->
-              tokenize_loop(
-                rest,
-                tokens,
-                current,
-                in_iri,
-                in_literal,
-                quote_depth,
-              )
-            False ->
-              tokenize_loop(
-                rest,
-                [current, ..tokens],
-                "",
-                in_iri,
-                in_literal,
-                quote_depth,
-              )
-          }
-        }
-        _, _, _, _ ->
-          tokenize_loop(
-            rest,
-            tokens,
-            current <> char,
-            in_iri,
-            in_literal,
-            quote_depth,
-          )
-      }
-    }
-  }
-}
-
-fn parse_term_as_subject(term_str: String) -> Result(term.Subject, String) {
-  case parse_term(term_str) {
-    Ok(parsed_term) ->
-      case term.subject_from_term(parsed_term) {
-        Ok(subject) -> Ok(subject)
-        Error(_) -> Error("Invalid term in subject position: " <> term_str)
-      }
-    Error(msg) -> Error(msg)
-  }
-}
-
-fn parse_term_as_object(term_str: String) -> Result(term.Object, String) {
-  case parse_term(term_str) {
-    Ok(parsed_term) -> Ok(term.object_from_term(parsed_term))
-    Error(msg) -> Error(msg)
-  }
-}
-
-fn parse_term(term_str: String) -> Result(term.Term, String) {
-  // Check for quoted triple first before checking for plain IRI
-  case string.starts_with(term_str, "<<(") {
-    True -> parse_quoted_triple(term_str)
-    False -> {
-      case string.first(term_str) {
-        Ok("<") ->
-          case string.ends_with(term_str, ">") {
-            True -> parse_iri_ref(term_str) |> result.map(term.NamedTerm)
-            False -> Error("Unrecognized term format: " <> term_str)
-          }
-        Ok("_") ->
-          case string.starts_with(term_str, "_:") {
-            True -> parse_blank_node(term_str)
-            False -> Error("Unrecognized term format: " <> term_str)
-          }
-        Ok("\"") -> parse_literal(term_str)
-        Ok(_) -> Error("Unrecognized term format: " <> term_str)
-        Error(_) -> Error("Empty term string")
-      }
-    }
-  }
-}
-
-fn parse_iri_ref(iri_str: String) -> Result(term.NamedNode, String) {
-  case string.starts_with(iri_str, "<") && string.ends_with(iri_str, ">") {
-    True -> {
-      let iri_content =
-        iri_str
-        |> string.drop_start(1)
-        |> string.drop_end(1)
-        |> unescape_iri
-
-      case term.named_node(iri_content) {
-        Ok(node) -> Ok(node)
-        Error(_) -> Error("Invalid IRI: " <> iri_content)
-      }
-    }
-    False -> Error("IRI must be enclosed in angle brackets: " <> iri_str)
-  }
-}
-
-fn parse_blank_node(blank_str: String) -> Result(term.Term, String) {
-  case string.starts_with(blank_str, "_:") {
-    True -> {
-      let identifier = string.drop_start(blank_str, 2)
-      case term.blank_node(identifier) {
-        Ok(node) -> Ok(term.BlankTerm(node))
-        Error(_) -> Error("Invalid blank node identifier: " <> identifier)
-      }
-    }
-    False -> Error("Blank node must start with '_:': " <> blank_str)
-  }
-}
-
-fn parse_literal(literal_str: String) -> Result(term.Term, String) {
-  case parse_string_literal(literal_str) {
-    Ok(#(value, remainder)) -> {
-      case remainder {
-        "" -> Ok(term.LiteralTerm(term.simple_literal(value)))
-        _ -> {
-          case string.starts_with(remainder, "^^") {
-            True -> {
-              let datatype_str = string.drop_start(remainder, 2)
-              case parse_iri_ref(datatype_str) {
-                Ok(datatype) ->
-                  Ok(term.LiteralTerm(term.typed_literal(value, datatype)))
-                Error(msg) -> Error("Invalid datatype: " <> msg)
-              }
-            }
-            False -> {
-              case string.starts_with(remainder, "@") {
-                True -> {
-                  let lang_str = string.drop_start(remainder, 1)
-                  case term.language_tag(lang_str) {
-                    Ok(lang_tag) ->
-                      Ok(
-                        term.LiteralTerm(term.language_literal(value, lang_tag)),
-                      )
-                    Error(_) -> Error("Invalid language tag: " <> lang_str)
-                  }
-                }
-                False -> Error("Invalid literal format: " <> literal_str)
-              }
-            }
-          }
-        }
-      }
-    }
-    Error(msg) -> Error(msg)
-  }
-}
-
-fn parse_quoted_triple(triple_str: String) -> Result(term.Term, String) {
-  case
-    string.starts_with(triple_str, "<<(") && string.ends_with(triple_str, ")>>")
-  {
-    True -> {
-      let inner_content =
-        triple_str
-        |> string.drop_start(3)
-        |> string.drop_end(3)
-        |> string.trim
-
-      case parse_triple_content(inner_content) {
-        Ok(triple) -> {
-          let statement.Triple(
-            subject: subject,
-            predicate: predicate,
-            object: object,
-          ) = triple
-          let quoted_triple = term.triple_term(subject, predicate, object)
-          Ok(term.QuotedTripleTerm(quoted_triple))
-        }
-        Error(msg) -> Error("Invalid quoted triple: " <> msg)
-      }
-    }
-    False ->
-      Error("Quoted triple must be enclosed in <<( ... )>>: " <> triple_str)
-  }
-}
-
-fn parse_string_literal(
-  literal_str: String,
-) -> Result(#(String, String), String) {
-  case string.starts_with(literal_str, "\"") {
-    True -> {
-      case find_string_end(literal_str, 1) {
-        Some(end_pos) -> {
-          let value =
-            literal_str
-            |> string.slice(1, end_pos - 1)
-            |> unescape_string
-          let remainder = string.drop_start(literal_str, end_pos + 1)
-          Ok(#(value, remainder))
-        }
-        None -> Error("Unterminated string literal: " <> literal_str)
-      }
-    }
-    False -> Error("String literal must start with quote: " <> literal_str)
-  }
-}
-
-fn find_string_end(text: String, pos: Int) -> Option(Int) {
-  case string.slice(text, pos, 1) {
-    "\"" -> {
-      // Check if it's escaped
-      case count_preceding_backslashes(text, pos) % 2 {
-        0 -> Some(pos)
-        _ -> find_string_end(text, pos + 1)
-      }
-    }
-    "" -> None
-    _ -> find_string_end(text, pos + 1)
-  }
-}
-
-fn count_preceding_backslashes(text: String, pos: Int) -> Int {
-  count_backslashes_loop(text, pos - 1, 0)
-}
-
-fn count_backslashes_loop(text: String, pos: Int, count: Int) -> Int {
-  case pos < 0 {
-    True -> count
-    False ->
-      case string.slice(text, pos, 1) {
-        "\\" -> count_backslashes_loop(text, pos - 1, count + 1)
-        _ -> count
-      }
-  }
-}
-
-// Serialization functions
-
-fn serialize_triple(triple: statement.Triple) -> String {
-  let statement.Triple(subject: subject, predicate: predicate, object: object) =
-    triple
-
-  serialize_subject(subject)
-  <> " "
-  <> serialize_predicate(predicate)
-  <> " "
-  <> serialize_object(object)
-  <> " ."
-}
-
-fn serialize_subject(subject: term.Subject) -> String {
-  case subject {
-    term.SubjectNamed(node) -> serialize_named_node(node)
-    term.SubjectBlank(node) -> serialize_blank_node(node)
-    term.SubjectTriple(triple) -> serialize_quoted_triple(triple)
-  }
-}
-
-fn serialize_predicate(predicate: term.Predicate) -> String {
-  serialize_named_node(predicate)
-}
-
-fn serialize_object(object: term.Object) -> String {
-  case object {
-    term.ObjectNamed(node) -> serialize_named_node(node)
-    term.ObjectBlank(node) -> serialize_blank_node(node)
-    term.ObjectLiteral(literal) -> serialize_literal(literal)
-    term.ObjectTriple(triple) -> serialize_quoted_triple(triple)
-  }
-}
-
-fn serialize_named_node(node: term.NamedNode) -> String {
-  let term.NamedNode(iri) = node
-  "<" <> escape_iri(iri) <> ">"
-}
-
-fn serialize_blank_node(node: term.BlankNode) -> String {
-  let term.BlankNode(id) = node
-  "_:" <> id
-}
-
-fn serialize_literal(literal: term.Literal) -> String {
-  case literal {
-    term.SimpleLiteral(value) -> "\"" <> escape_string(value) <> "\""
-    term.LanguageTaggedLiteral(value, tag) -> {
-      let term.LanguageTag(lang) = tag
-      "\"" <> escape_string(value) <> "\"@" <> lang
-    }
-    term.TypedLiteral(value, datatype) ->
-      "\"" <> escape_string(value) <> "\"^^" <> serialize_named_node(datatype)
-  }
-}
-
-fn serialize_quoted_triple(triple: term.TripleTerm) -> String {
-  let term.TripleTerm(subject, predicate, object) = triple
-  "<<( "
-  <> serialize_subject(subject)
-  <> " "
-  <> serialize_predicate(predicate)
-  <> " "
-  <> serialize_object(object)
-  <> " )>>"
-}
-
-// String escaping functions
-
-fn escape_string(text: String) -> String {
-  text
-  |> string.replace("\\", "\\\\")
-  |> string.replace("\"", "\\\"")
-  |> string.replace("\n", "\\n")
-  |> string.replace("\r", "\\r")
-  |> string.replace("\t", "\\t")
-}
-
-fn unescape_string(text: String) -> String {
-  text
-  |> string.replace("\\n", "\n")
-  |> string.replace("\\r", "\r")
-  |> string.replace("\\t", "\t")
-  |> string.replace("\\\"", "\"")
-  |> string.replace("\\\\", "\\")
-}
-
-fn escape_iri(iri: String) -> String {
-  // N-Triples requires escaping of certain characters in IRIs
-  iri
-  |> string.replace("\\", "\\\\")
-  |> string.replace("\"", "\\\"")
-  |> string.replace("\n", "\\n")
-  |> string.replace("\r", "\\r")
-  |> string.replace("\t", "\\t")
-}
-
-fn unescape_iri(iri: String) -> String {
-  iri
-  |> string.replace("\\n", "\n")
-  |> string.replace("\\r", "\r")
-  |> string.replace("\\t", "\t")
-  |> string.replace("\\\"", "\"")
-  |> string.replace("\\\\", "\\")
 }
 
 // Streaming Operations
 
-/// Stream parse N-Triples from a file line by line.
+/// Fold over the triples of an N-Triples file without holding the file or
+/// the triples in memory.
 ///
-/// This function reads the file line by line without loading the entire
-/// file into memory, making it suitable for processing very large N-Triples
-/// files. Each line is parsed as it's read and added to the graph.
+/// The file is read one line at a time and `f` is called with each triple in
+/// file order (duplicates included). Only the current line and your
+/// accumulator are kept, so memory use stays constant regardless of file
+/// size. Works on both the Erlang and JavaScript targets.
+///
+/// Errors use the same `NTriplesError` as `parse_file`: a syntax error has
+/// the same message and line number, and file errors (open, read, close)
+/// have a `"File error: ..."` message. Invalid UTF-8 is reported with the
+/// number of the offending line.
+///
+/// ## Examples
+/// ```gleam
+/// // Count the triples of a large file in constant memory
+/// case ntriples.streaming_fold_file("large.nt", from: 0, with: fn(count, _) {
+///   count + 1
+/// }) {
+///   Ok(count) -> io.println(int.to_string(count) <> " triples")
+///   Error(ntriples.NTriplesError(message, line)) ->
+///     io.println(message <> " at line " <> int.to_string(line))
+/// }
+/// ```
+pub fn streaming_fold_file(
+  path: String,
+  from initial: acc,
+  with f: fn(acc, statement.Triple) -> acc,
+) -> Result(acc, NTriplesError) {
+  use acc, quad <- streaming.fold_statements(
+    path,
+    rdf_syntax.NTriples,
+    initial,
+    NTriplesError,
+  )
+  f(acc, statement.triple_from_quad(quad))
+}
+
+/// Parse an N-Triples file by reading it line by line.
+///
+/// The file text is never loaded as a whole: each line is read and parsed in
+/// turn, which works on both the Erlang and JavaScript targets. The resulting
+/// graph is still held in memory, so memory use grows with the number of
+/// triples. To process a file in constant memory, use `streaming_fold_file`.
+///
+/// The result is equal (`==`) to what `parse_file` returns for the same file,
+/// and errors are the same `NTriplesError` values (see `streaming_fold_file`).
 ///
 /// ## Examples
 /// ```gleam
 /// case ntriples.streaming_parse_file("large_dataset.nt") {
-///   Ok(document) -> {
-///     io.println("Successfully parsed " <> int.to_string(graph.size(document.graph)) <> " triples")
-///   }
-///   Error(file_stream_error.Enoent) -> io.println("File not found")
-///   Error(file_stream_error.Eacces) -> io.println("Permission denied")
-///   // ... other file errors
+///   Ok(document) ->
+///     io.println(int.to_string(graph.size(document.graph)) <> " triples")
+///   Error(ntriples.NTriplesError(message, line)) ->
+///     io.println(message <> " at line " <> int.to_string(line))
 /// }
 /// ```
 pub fn streaming_parse_file(
-  filename: String,
-) -> Result(NTriplesDocument, file_stream_error.FileStreamError) {
-  use stream <- result.try(file_stream.open_read(filename))
-  let result = streaming_parse_from_stream(stream)
-  // Always try to close the stream
-  let _ = file_stream.close(stream)
-  case result {
-    Ok(document) -> Ok(document)
-    Error(_) -> Error(file_stream_error.Eio)
-    // Generic I/O error for parse failures
-  }
+  path: String,
+) -> Result(NTriplesDocument, NTriplesError) {
+  streaming_fold_file(path, from: [], with: fn(acc, triple) { [triple, ..acc] })
+  |> result.map(fn(triples) {
+    NTriplesDocument(graph: graph.from_list(list.reverse(triples)))
+  })
 }
 
-/// Stream serialize N-Triples graph to a file line by line.
+/// Serialize an RDF graph to an N-Triples file, writing it in batches of
+/// lines instead of building the whole document as one string first.
 ///
-/// This function writes triples to the file one by one without building
-/// the entire serialized content in memory first, making it suitable for
-/// serializing very large graphs.
+/// The output is byte-for-byte the same as `serialize_graph`. The file is
+/// created or truncated. Errors from writing and from closing the file (where
+/// buffered write failures such as a full disk are reported) are returned as
+/// an `NTriplesError` with a `"File error: ..."` message and line 0.
 ///
 /// ## Examples
 /// ```gleam
-/// let my_graph = graph.new()
-///   |> graph.add(statement.Triple(...))
-///   
 /// case ntriples.streaming_serialize_to_file(my_graph, "output.nt") {
-///   Ok(Nil) -> io.println("Graph successfully written to file")
-///   Error(file_stream_error.Eacces) -> io.println("Permission denied")
-///   // ... other file errors
+///   Ok(Nil) -> io.println("Graph written")
+///   Error(ntriples.NTriplesError(message, _)) -> io.println(message)
 /// }
 /// ```
 pub fn streaming_serialize_to_file(
-  graph: graph.Graph,
-  filename: String,
-) -> Result(Nil, file_stream_error.FileStreamError) {
-  use stream <- result.try(file_stream.open_write(filename))
-  let result = streaming_serialize_graph_to_stream(graph, stream)
-  // Always try to close the stream
-  let _ = file_stream.close(stream)
-  result
-}
-
-// Internal streaming helper functions
-
-fn streaming_parse_from_stream(
-  stream: file_stream.FileStream,
-) -> Result(NTriplesDocument, NTriplesError) {
-  let empty_graph = graph.new()
-  streaming_parse_lines(stream, empty_graph, 1)
-}
-
-fn streaming_parse_lines(
-  stream: file_stream.FileStream,
-  acc_graph: graph.Graph,
-  line_number: Int,
-) -> Result(NTriplesDocument, NTriplesError) {
-  case file_stream.read_line(stream) {
-    Ok(line) -> {
-      let trimmed_line = string.trim(line)
-      case trimmed_line {
-        // Skip empty lines and comments
-        "" | "#" <> _ ->
-          streaming_parse_lines(stream, acc_graph, line_number + 1)
-        _ -> {
-          case parse_line(trimmed_line, line_number) {
-            Ok(triple) -> {
-              let updated_graph = graph.add(acc_graph, triple)
-              streaming_parse_lines(stream, updated_graph, line_number + 1)
-            }
-            Error(err) -> Error(err)
-          }
-        }
-      }
-    }
-    Error(file_stream_error.Eof) -> {
-      // End of file - return the accumulated graph
-      Ok(NTriplesDocument(graph: acc_graph))
-    }
-    Error(_) -> {
-      Error(NTriplesError("Failed to read line from stream", line_number))
-    }
-  }
-}
-
-fn streaming_serialize_graph_to_stream(
-  graph: graph.Graph,
-  stream: file_stream.FileStream,
-) -> Result(Nil, file_stream_error.FileStreamError) {
-  let triples_list = graph.triples
-  streaming_write_triples(triples_list, stream)
-}
-
-fn streaming_write_triples(
-  triples_list: List(statement.Triple),
-  stream: file_stream.FileStream,
-) -> Result(Nil, file_stream_error.FileStreamError) {
-  case triples_list {
-    [] -> Ok(Nil)
-    [triple, ..rest] -> {
-      let line = serialize_triple(triple) <> "\n"
-      case file_stream.write_chars(stream, line) {
-        Ok(_) -> streaming_write_triples(rest, stream)
-        Error(err) -> Error(err)
-      }
-    }
-  }
+  rdf_graph: graph.Graph,
+  path: String,
+) -> Result(Nil, NTriplesError) {
+  streaming.write_lines(
+    path,
+    graph.triples(rdf_graph),
+    rdf_syntax.serialize_triple,
+    NTriplesError,
+  )
 }
