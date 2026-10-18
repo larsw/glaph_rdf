@@ -741,8 +741,9 @@ pub fn serialize_best_prefix_match_test() {
 
   // Should use the more specific prefix for the deep resource
   should.be_true(string.contains(serialized, "deep:resource"))
-  // Should use the general prefix for the shallow resource
-  should.be_true(string.contains(serialized, "ex:path/resource"))
+  // Should use the general prefix for the shallow resource; '/' is not
+  // allowed unescaped in a local name.
+  should.be_true(string.contains(serialized, "ex:path\\/resource"))
 }
 
 // Test serialization with empty prefix

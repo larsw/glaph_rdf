@@ -14,7 +14,15 @@ The N-Triples serializer provides full W3C N-Triples 1.1 compliance with RDF-sta
 - **Round-trip Serialization**: Parse and serialize without data loss
 - **Unicode Support**: Proper handling of UTF-8 encoded content
 - **Blank Node Support**: Local blank node identifiers
-- **Literal Support**: Simple, language-tagged, and typed literals
+- **Literal Support**: Simple, language-tagged, RDF 1.2 directional
+  language-tagged (`"text"@ar--rtl`, base direction `ltr` or `rtl`), and typed literals
+- **Canonical language tags**: As canonical N-Triples 1.2 (section 3) requires,
+  the writer prints `LANG_DIR` in lowercase: `"chat"@EN-GB--ltr` is written as
+  `"chat"@en-gb--ltr`. Language tags are case-insensitive, so reading it back
+  gives the same `LanguageTag("en-GB")` and an equal graph. The term model
+  (`term.language_tag`) and the Turtle / TriG writers keep BCP 47 display
+  case (`en-GB`, `zh-Hant`). The N-Quads writer, including the streaming
+  writers of both formats, follows the same rule.
 
 ### Usage Examples
 
@@ -56,7 +64,7 @@ case ntriples.parse(rdf_star_data) {
 The N-Triples serializer has comprehensive test coverage with 117+ test cases covering:
 
 - Basic triple parsing and serialization
-- All literal types (simple, language-tagged, typed)
+- All literal types (simple, language-tagged, directional language-tagged, typed)
 - Blank nodes and named nodes
 - RDF-star quoted triples (subject and object positions)
 - Unicode and escape sequence handling
@@ -140,7 +148,7 @@ The N-Quads serializer has comprehensive test coverage including:
 - Basic quad parsing with named graphs
 - Default graph handling (3-component statements)  
 - Multiple quads in single document
-- Language-tagged literals (`"Alice"@en`)
+- Language-tagged literals (`"Alice"@en`) and directional ones (`"Alice"@en--ltr`)
 - Typed literals with XML Schema datatypes
 - Blank node subjects and objects
 - Comment line handling

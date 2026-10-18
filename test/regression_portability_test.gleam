@@ -197,10 +197,15 @@ pub fn leading_bom_is_accepted_by_every_file_parser_test() {
   let assert Ok(_) = trig_doc
 }
 
-pub fn leading_bom_is_not_stripped_by_parse_test() {
-  // `parse` takes text, not a file: a U+FEFF there is a syntax error.
-  let assert Error(ntriples.NTriplesError(_, 1)) =
+pub fn only_one_leading_bom_is_stripped_by_parse_test() {
+  // `parse` skips one leading byte order mark, like the file readers; a
+  // second U+FEFF is a syntax error.
+  let assert Ok(_) =
     ntriples.parse("\u{FEFF}<http://ex.org/s> <http://ex.org/p> \"o\" .\n")
+  let assert Error(ntriples.NTriplesError(_, 1)) =
+    ntriples.parse(
+      "\u{FEFF}\u{FEFF}<http://ex.org/s> <http://ex.org/p> \"o\" .\n",
+    )
 }
 
 // CRLF ------------------------------------------------------------------------

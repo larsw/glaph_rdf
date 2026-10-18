@@ -659,6 +659,17 @@ fn serialize_object(object: term.Object) -> String {
     term.ObjectLiteral(term.SimpleLiteral(value)) -> "L:" <> value
     term.ObjectLiteral(term.LanguageTaggedLiteral(value, term.LanguageTag(lang))) ->
       "L:" <> value <> "@" <> lang
+    term.ObjectLiteral(term.DirectionalLanguageTaggedLiteral(
+      value,
+      term.LanguageTag(lang),
+      direction,
+    )) ->
+      "L:"
+      <> value
+      <> "@"
+      <> lang
+      <> "--"
+      <> term.base_direction_to_string(direction)
     term.ObjectLiteral(term.TypedLiteral(value, term.NamedNode(datatype))) ->
       "L:" <> value <> "^^" <> datatype
     term.ObjectTriple(_) -> "T:QUOTED"

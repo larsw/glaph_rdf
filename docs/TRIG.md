@@ -13,13 +13,22 @@ The TriG serializer extends Turtle functionality to support RDF datasets with na
 - **Default Graph**: Triples without explicit graph context are placed in the default graph
 - **Base URIs**: Support for `@base` directives
 - **Prefixes**: Full support for `@prefix` declarations with intelligent prefix usage
-- **All RDF Terms**: Named nodes, blank nodes, literals (simple, language-tagged, typed)
+  (declarations are written sorted by label)
+- **All RDF 1.2 Terms**: Named nodes, blank nodes, literals (simple,
+  language-tagged, directional language-tagged `"x"@en--ltr`, typed) and
+  triple terms `<<( s p o )>>`
 - **Escape Sequences**: Proper escaping of strings and IRIs
 - **RDF Type Shorthand**: Uses `a` for `rdf:type` predicates
 
 ### Current Limitations
 
-- **Parser**: Basic TriG parsing (falls back to Turtle parser for most cases)
+- **Parser**: Reads `{ … }`, `label { … }` and `GRAPH label { … }` blocks
+  (IRI, prefixed-name or blank-node labels) and plain Turtle triples as the
+  default graph, with the same term support as the Turtle parser. Like the
+  Turtle parser it does not yet read collections `( … )`, `[ … ]` blank
+  nodes, reified triples `<< … >>`, reifiers `s p o ~ r`, annotations
+  `{| … |}`, the RDF 1.2 version directive (`VERSION "1.2"` /
+  `@version "1.2" .`) or SPARQL-style `PREFIX` / `BASE`
 - **Empty Named Graphs**: Empty graphs are not serialized (no quads means no graph tracking)
 - **SPARQL Extensions**: Advanced TriG features like reified triples not yet supported
 

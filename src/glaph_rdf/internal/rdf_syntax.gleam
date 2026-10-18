@@ -8,7 +8,9 @@
 //// Implements the W3C RDF 1.2 N-Triples / N-Quads grammar:
 //// - `IRIREF` with `UCHAR` escapes (`\uXXXX`, `\UXXXXXXXX`)
 //// - `STRING_LITERAL_QUOTE` with `ECHAR` (`\t \b \n \r \f \" \' \\`) and
-////   `UCHAR` escapes, optionally followed by `@lang` or `^^<datatype>`
+////   `UCHAR` escapes, optionally followed by `@lang`, `@lang--dir`
+////   (`LANG_DIR`, base direction `ltr` or `rtl`) or `^^<datatype>`
+////   (except `rdf:langString` / `rdf:dirLangString`, which need a tag)
 //// - `BLANK_NODE_LABEL`
 //// - triple terms `<<( s p o )>>` (the older `<< s p o >>` form is also read)
 //// - blank lines, full-line comments and a comment after the final `.`
@@ -31,6 +33,11 @@ pub type Syntax {
 
 type Chars =
   List(String)
+
+const rdf_lang_string = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"
+
+const rdf_dir_lang_string =
+  "http://www.w3.org/1999/02/22-rdf-syntax-ns#dirLangString"
 
 // Parsing ---------------------------------------------------------------------
 
@@ -346,7 +353,7 @@ fn is_blank_label_char(char: String) -> Bool {
 }
 
 /// Parses a `STRING_LITERAL_QUOTE` body (after the opening `"`) plus an
-/// optional `@lang` or `^^<datatype>` suffix.
+/// optional `@lang`, `@lang--dir` or `^^<datatype>` suffix.
 fn parse_literal(input: Chars) -> Result(#(term.Literal, Chars), String) {
   use #(value, rest) <- result.try(read_string(input, []))
   case rest {
@@ -355,18 +362,100 @@ fn parse_literal(input: Chars) -> Result(#(term.Literal, Chars), String) {
         parse_iri(rest)
         |> result.map_error(fn(msg) { "Invalid datatype: " <> msg }),
       )
-      Ok(#(term.typed_literal(value, datatype), rest))
+      use literal <- result.map(typed_literal(value, datatype))
+      #(literal, rest)
     }
     ["^", "^", ..] -> Error("Expected a datatype IRI after '^^'")
     ["@", ..rest] -> {
       let #(tag_chars, rest) = list.split_while(rest, is_language_tag_char)
-      let tag = string.concat(tag_chars)
-      case term.language_tag(tag) {
-        Ok(language) -> Ok(#(term.language_literal(value, language), rest))
-        Error(_) -> Error("Invalid language tag: " <> tag)
-      }
+      use literal <- result.map(lang_dir_literal(
+        value,
+        string.concat(tag_chars),
+      ))
+      #(literal, rest)
     }
     _ -> Ok(#(term.simple_literal(value), rest))
+  }
+}
+
+/// Builds the literal for a `"value"^^<datatype>` suffix. RDF 1.2 Concepts
+/// says a literal has a language tag if and only if its datatype is
+/// `rdf:langString` or `rdf:dirLangString` (and a base direction if and only
+/// if it is `rdf:dirLangString`), so those two datatypes cannot be written
+/// with `^^` (W3C `ntriples-langdir-bad-3` / `-bad-5`). Shared by the
+/// N-Triples, N-Quads, Turtle and TriG parsers.
+///
+/// ## Examples
+/// ```gleam
+/// typed_literal("42", term.NamedNode("http://www.w3.org/2001/XMLSchema#integer"))
+/// // -> Ok(TypedLiteral("42", NamedNode("http://www.w3.org/2001/XMLSchema#integer")))
+/// typed_literal("x", term.NamedNode("http://www.w3.org/1999/02/22-rdf-syntax-ns#dirLangString"))
+/// // -> Error("Datatype rdf:dirLangString needs a language tag and base direction (write \"x\"@tag--ltr)")
+/// ```
+pub fn typed_literal(
+  value: String,
+  datatype: term.NamedNode,
+) -> Result(term.Literal, String) {
+  let term.NamedNode(iri) = datatype
+  case iri {
+    _ if iri == rdf_lang_string ->
+      Error("Datatype rdf:langString needs a language tag (write \"...\"@tag)")
+    _ if iri == rdf_dir_lang_string ->
+      Error(
+        "Datatype rdf:dirLangString needs a language tag and base direction (write \"...\"@tag--ltr)",
+      )
+    _ -> Ok(term.typed_literal(value, datatype))
+  }
+}
+
+/// Builds the literal for a `LANG_DIR` suffix (the text after `@`):
+/// `[a-zA-Z]+ ('-' [a-zA-Z0-9]+)* ('--' [a-zA-Z]+)?`. The language tag is
+/// ASCII case-insensitive; the optional base direction after `--` must be
+/// exactly `ltr` or `rtl` (lowercase, as RDF 1.2 Concepts requires).
+/// Shared by the N-Triples, N-Quads, Turtle and TriG parsers so they accept
+/// the same suffixes and report the same errors.
+///
+/// ## Examples
+/// ```gleam
+/// lang_dir_literal("Hello", "en")
+/// // -> Ok(LanguageTaggedLiteral("Hello", LanguageTag("en")))
+/// lang_dir_literal("Hello", "EN--rtl")
+/// // -> Ok(DirectionalLanguageTaggedLiteral("Hello", LanguageTag("en"), RightToLeft))
+/// lang_dir_literal("Hello", "en--RTL")
+/// // -> Error("Invalid base direction 'RTL' in @en--RTL (expected ltr or rtl)")
+/// lang_dir_literal("Hello", "en--up")
+/// // -> Error("Invalid base direction 'up' in @en--up (expected ltr or rtl)")
+/// ```
+pub fn lang_dir_literal(
+  value: String,
+  lang_dir: String,
+) -> Result(term.Literal, String) {
+  case string.split_once(lang_dir, "--") {
+    Error(_) ->
+      case term.language_tag(lang_dir) {
+        Ok(language) -> Ok(term.language_literal(value, language))
+        Error(_) -> Error("Invalid language tag: " <> lang_dir)
+      }
+    Ok(#(tag, direction)) -> {
+      use language <- result.try(case tag {
+        "" ->
+          Error("Missing language tag before base direction in @" <> lang_dir)
+        _ ->
+          term.language_tag(tag)
+          |> result.replace_error("Invalid language tag: " <> tag)
+      })
+      use direction <- result.map(
+        term.base_direction(direction)
+        |> result.replace_error(
+          "Invalid base direction '"
+          <> direction
+          <> "' in @"
+          <> lang_dir
+          <> " (expected ltr or rtl)",
+        ),
+      )
+      term.directional_language_literal(value, language, direction)
+    }
   }
 }
 
@@ -498,13 +587,31 @@ fn serialize_blank_node(node: term.BlankNode) -> String {
 fn serialize_literal(literal: term.Literal) -> String {
   case literal {
     term.SimpleLiteral(value) -> "\"" <> escape_string(value) <> "\""
-    term.LanguageTaggedLiteral(value, tag) -> {
-      let term.LanguageTag(lang) = tag
-      "\"" <> escape_string(value) <> "\"@" <> lang
-    }
+    term.LanguageTaggedLiteral(value, tag) ->
+      "\"" <> escape_string(value) <> "\"@" <> canonical_lang(tag)
+    term.DirectionalLanguageTaggedLiteral(value, tag, direction) ->
+      "\""
+      <> escape_string(value)
+      <> "\"@"
+      <> canonical_lang(tag)
+      <> "--"
+      <> term.base_direction_to_string(direction)
     term.TypedLiteral(value, datatype) ->
       "\"" <> escape_string(value) <> "\"^^" <> serialize_named_node(datatype)
   }
+}
+
+/// The language tag as canonical N-Triples / N-Quads writes it.
+///
+/// RDF 1.2 N-Triples section 3 (Canonical N-Triples) says alphabetic
+/// characters in `LANG_DIR` MUST be lowercase `[a-z]`. `term.language_tag`
+/// stores tags in BCP 47 display case (`en-GB`, `zh-Hant`), which Turtle and
+/// TriG keep, so the line-based writers lowercase here. Reading the output
+/// back is lossless: `term.language_tag` is case-insensitive, so `@en-gb`
+/// parses to the same `LanguageTag("en-GB")`.
+fn canonical_lang(tag: term.LanguageTag) -> String {
+  let term.LanguageTag(lang) = tag
+  string.lowercase(lang)
 }
 
 /// Escape a literal's lexical form for `STRING_LITERAL_QUOTE`, following the

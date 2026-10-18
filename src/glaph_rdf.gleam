@@ -28,6 +28,9 @@ pub type BlankNode =
 pub type LanguageTag =
   term_mod.LanguageTag
 
+pub type BaseDirection =
+  term_mod.BaseDirection
+
 pub type Literal =
   term_mod.Literal
 
@@ -115,7 +118,52 @@ pub fn language_literal(value: String, tag: LanguageTag) -> Literal {
   term_mod.language_literal(value, tag)
 }
 
+/// Parse an RDF 1.2 base direction: exactly `ltr` or `rtl` (lowercase, as
+/// RDF 1.2 Concepts requires).
+///
+/// ## Examples
+/// ```gleam
+/// base_direction("rtl")
+/// // -> Ok(term.RightToLeft)
+/// base_direction("up")
+/// // -> Error(term.InvalidBaseDirection("up"))
+/// ```
+pub fn base_direction(value: String) -> Result(BaseDirection, TermError) {
+  term_mod.base_direction(value)
+}
+
+/// Construct an RDF 1.2 directional language-tagged literal
+/// (`"value"@tag--ltr`, datatype `rdf:dirLangString`).
+///
+/// ## Examples
+/// ```gleam
+/// let assert Ok(tag) = language_tag("ar")
+/// let assert Ok(direction) = base_direction("rtl")
+/// directional_language_literal("مرحبا", tag, direction)
+/// // -> term.DirectionalLanguageTaggedLiteral("مرحبا", tag, term.RightToLeft)
+/// ```
+pub fn directional_language_literal(
+  value: String,
+  tag: LanguageTag,
+  direction: BaseDirection,
+) -> Literal {
+  term_mod.directional_language_literal(value, tag, direction)
+}
+
 /// Construct a typed literal given an RDF datatype IRI.
+///
+/// The datatype must not be `rdf:langString` or `rdf:dirLangString`: such a
+/// literal has no language tag, so it is not well-formed RDF, and the parsers
+/// reject what the writers print for it. Use `language_literal` or
+/// `directional_language_literal` for language-tagged strings.
+///
+/// ## Examples
+/// ```gleam
+/// let assert Ok(datatype) =
+///   named_node("http://www.w3.org/2001/XMLSchema#integer")
+/// typed_literal("42", datatype)
+/// // -> term.TypedLiteral("42", datatype)
+/// ```
 pub fn typed_literal(value: String, datatype: NamedNode) -> Literal {
   term_mod.typed_literal(value, datatype)
 }

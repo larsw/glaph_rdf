@@ -39,22 +39,23 @@ pub fn strip_bom(text: String) -> String {
   }
 }
 
-/// Reads a UTF-8 text file. A single byte order mark at the start of the file
-/// is removed; any other U+FEFF is kept, so the result is the same on both
-/// targets. Invalid UTF-8 is reported as `simplifile.NotUtf8`.
+/// Reads a UTF-8 text file, keeping every U+FEFF (including a leading byte
+/// order mark) so the result is the same on both targets. The string parsers
+/// strip one leading byte order mark themselves, so `parse_file` and `parse`
+/// agree. Invalid UTF-8 is reported as `simplifile.NotUtf8`.
 ///
 /// ## Examples
 ///
 /// ```gleam
 /// // data.nt starts with the bytes EF BB BF
 /// utf8.read_file("data.nt")
-/// // -> Ok("<a> <b> <c> .\n")
+/// // -> Ok("\u{FEFF}<a> <b> <c> .\n")
 /// ```
 pub fn read_file(path: String) -> Result(String, simplifile.FileError) {
   case simplifile.read_bits(path) {
     Ok(bytes) ->
       case decode(bytes) {
-        Ok(text) -> Ok(strip_bom(text))
+        Ok(text) -> Ok(text)
         Error(Nil) -> Error(simplifile.NotUtf8)
       }
     Error(error) -> Error(error)

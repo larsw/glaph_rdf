@@ -1,11 +1,8 @@
 import glaph_rdf/graph
 import glaph_rdf/statement
 import glaph_rdf/term
-import gleam/int
 import gleam/list
-import gleam/order
 import gleam/set
-import gleam/string
 
 /// An RDF dataset containing multiple named graphs and a default graph.
 ///
@@ -359,14 +356,12 @@ fn prepend_new(acc: List(a), seen: set.Set(a), items: List(a)) -> List(a) {
 
 /// Check if two RDF datasets are isomorphic (logically equivalent).
 ///
-/// Two datasets are isomorphic if their default graphs are isomorphic and
-/// all corresponding named graphs are isomorphic. This accounts for blank node
-/// differences across all graphs within the datasets.
-///
-/// The comparison handles:
-/// - Default graph isomorphism (blank node relabeling)
-/// - Named graph isomorphism (including blank graph names)
-/// - Structural equivalence across the entire dataset
+/// Two datasets are isomorphic if there is a single bijection between their
+/// blank nodes that makes them identical. The same bijection applies across
+/// the default graph and every named graph, to blank graph names, and to
+/// blank nodes nested inside triple terms, so a blank node shared by two
+/// graphs (or used both as a graph name and inside a statement) must map to a
+/// blank node shared in the same way.
 ///
 /// ## Examples
 /// ```gleam
@@ -375,45 +370,28 @@ fn prepend_new(acc: List(a), seen: set.Set(a), items: List(a)) -> List(a) {
 ///   statement.quad(triple_with_blank2, term.NamedGraph(graph_iri))
 /// ])
 /// let dataset2 = dataset.from_list([
-///   statement.quad(triple_with_different_blank1, term.DefaultGraph),  
+///   statement.quad(triple_with_different_blank1, term.DefaultGraph),
 ///   statement.quad(triple_with_different_blank2, term.NamedGraph(graph_iri))
 /// ])
-/// 
+///
 /// dataset.isomorphic(dataset1, dataset2)  // -> True if structurally equivalent
 /// ```
 ///
 /// ## Complexity
-/// Time: O(g × n²) where g is the number of graphs and n is the average graph size
-/// Space: O(n) per graph for canonical representations
+/// See `graph.isomorphic`: the whole dataset is compared in one pass, with
+/// the graph name as part of each statement.
 pub fn isomorphic(dataset1: Dataset, dataset2: Dataset) -> Bool {
-  // Early size check for efficiency
-  case quad_count(dataset1) == quad_count(dataset2) {
-    False -> False
-    True -> {
-      // Check default graph isomorphism
-      let default1 = default_graph(dataset1)
-      let default2 = default_graph(dataset2)
-
-      case graph.isomorphic(default1, default2) {
-        False -> False
-        True -> {
-          // Check named graphs isomorphism
-          let names1 = graph_names(dataset1)
-          let names2 = graph_names(dataset2)
-
-          named_graphs_isomorphic(dataset1, names1, dataset2, names2)
-        }
-      }
-    }
-  }
+  graph.quads_isomorphic(dataset1.quads, dataset2.quads)
 }
 
 /// Create a canonical representation of an RDF dataset.
 ///
-/// Converts all blank nodes across all graphs to normalized forms using
-/// deterministic labeling. Graph names that are blank nodes are also
-/// canonicalized. The resulting dataset can be compared for exact equality
-/// to determine isomorphism.
+/// Relabels every blank node of the dataset (in any graph, as a graph name,
+/// or inside a triple term) to `b0`, `b1`, ... using one labelling for the
+/// whole dataset, so blank nodes shared between graphs stay shared. The
+/// labels depend only on the structure of the dataset; see
+/// `graph.canonicalize` for the caveat about highly symmetric inputs. The
+/// quad order is kept.
 ///
 /// ## Examples
 /// ```gleam
@@ -422,155 +400,7 @@ pub fn isomorphic(dataset1: Dataset, dataset2: Dataset) -> Bool {
 /// // All blank nodes across all graphs now have predictable labels
 /// ```
 pub fn canonicalize(dataset: Dataset) -> Dataset {
-  let canonical_quads = list.map(dataset.quads, canonicalize_quad)
-  Dataset(quads: canonical_quads)
-}
-
-// Internal helper functions for dataset isomorphism
-
-fn named_graphs_isomorphic(
-  dataset1: Dataset,
-  names1: List(term.GraphName),
-  dataset2: Dataset,
-  names2: List(term.GraphName),
-) -> Bool {
-  case list.length(names1) == list.length(names2) {
-    False -> False
-    True -> {
-      // Normalize graph names and check isomorphism
-      let canonical_names1 = canonicalize_graph_names(names1)
-      let canonical_names2 = canonicalize_graph_names(names2)
-
-      case canonical_names1 == canonical_names2 {
-        False -> False
-        True -> {
-          // Check each corresponding named graph for isomorphism
-          list.all(canonical_names1, fn(canonical_name) {
-            let orig_name1 = find_original_graph_name(names1, canonical_name)
-            let orig_name2 = find_original_graph_name(names2, canonical_name)
-
-            case orig_name1, orig_name2 {
-              Ok(name1), Ok(name2) -> {
-                let graph1 = graph(dataset1, name1)
-                let graph2 = graph(dataset2, name2)
-                graph.isomorphic(graph1, graph2)
-              }
-              _, _ -> False
-            }
-          })
-        }
-      }
-    }
-  }
-}
-
-fn canonicalize_graph_names(
-  names: List(term.GraphName),
-) -> List(term.GraphName) {
-  // Extract blank graph names for canonicalization
-  let blank_names =
-    list.filter_map(names, fn(name) {
-      case name {
-        term.BlankGraph(blank) -> Ok(blank)
-        _ -> Error(Nil)
-      }
-    })
-
-  // Create mapping for blank graph names
-  let blank_mapping = create_blank_graph_mapping(blank_names)
-
-  // Apply canonicalization
-  names
-  |> list.map(fn(name) { canonicalize_graph_name(name, blank_mapping) })
-  |> list.sort(compare_graph_names)
-}
-
-fn create_blank_graph_mapping(
-  blanks: List(term.BlankNode),
-) -> List(#(String, String)) {
-  blanks
-  |> list.sort(fn(blank1, blank2) {
-    let term.BlankNode(id1) = blank1
-    let term.BlankNode(id2) = blank2
-    string.compare(id1, id2)
-  })
-  |> list.index_map(fn(blank, index) {
-    let term.BlankNode(original_id) = blank
-    let canonical_id = "bg" <> int.to_string(index)
-    #(original_id, canonical_id)
-  })
-}
-
-fn canonicalize_graph_name(
-  name: term.GraphName,
-  mapping: List(#(String, String)),
-) -> term.GraphName {
-  case name {
-    term.BlankGraph(term.BlankNode(id)) -> {
-      case list.find(mapping, fn(pair) { pair.0 == id }) {
-        Ok(#(_original, canonical)) ->
-          term.BlankGraph(term.BlankNode(canonical))
-        Error(_) -> name
-      }
-    }
-    _ -> name
-  }
-}
-
-fn compare_graph_names(
-  name1: term.GraphName,
-  name2: term.GraphName,
-) -> order.Order {
-  case name1, name2 {
-    term.DefaultGraph, term.DefaultGraph -> order.Eq
-    term.DefaultGraph, _ -> order.Lt
-    _, term.DefaultGraph -> order.Gt
-    term.NamedGraph(term.NamedNode(iri1)), term.NamedGraph(term.NamedNode(iri2))
-    -> string.compare(iri1, iri2)
-    term.BlankGraph(term.BlankNode(id1)), term.BlankGraph(term.BlankNode(id2))
-    -> string.compare(id1, id2)
-    term.NamedGraph(_), term.BlankGraph(_) -> order.Lt
-    term.BlankGraph(_), term.NamedGraph(_) -> order.Gt
-  }
-}
-
-fn find_original_graph_name(
-  names: List(term.GraphName),
-  canonical_name: term.GraphName,
-) -> Result(term.GraphName, Nil) {
-  case canonical_name {
-    term.NamedGraph(_) -> Ok(canonical_name)
-    term.DefaultGraph -> Ok(canonical_name)
-    term.BlankGraph(term.BlankNode(_canonical_id)) -> {
-      // Find the original blank graph name
-      list.find(names, fn(name) {
-        case name {
-          term.BlankGraph(_) -> True
-          _ -> False
-        }
-      })
-    }
-  }
-}
-
-fn canonicalize_quad(quad: statement.Quad) -> statement.Quad {
-  let statement.Quad(subject, predicate, object, graph_name) = quad
-
-  // Create a single-triple graph for canonicalization
-  let temp_triple = statement.Triple(subject, predicate, object)
-  let temp_graph = graph.from_list([temp_triple])
-  let canonical_graph = graph.canonicalize(temp_graph)
-
-  // Extract the canonicalized triple
-  case graph.triples(canonical_graph) {
-    [canonical_triple] -> {
-      let statement.Triple(canon_subject, canon_predicate, canon_object) =
-        canonical_triple
-      statement.Quad(canon_subject, canon_predicate, canon_object, graph_name)
-    }
-    _ -> quad
-    // Fallback to original if canonicalization fails
-  }
+  Dataset(quads: graph.canonicalize_quads(dataset.quads))
 }
 
 fn dedupe_graph_names(names: List(term.GraphName)) -> List(term.GraphName) {

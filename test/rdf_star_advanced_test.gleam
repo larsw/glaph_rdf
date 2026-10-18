@@ -5,6 +5,7 @@ import glaph_rdf/serializers/turtle
 import glaph_rdf/statement
 import glaph_rdf/term
 import gleam/dict
+import gleam/list
 import gleam/option.{None}
 import gleam/string
 import gleeunit
@@ -303,9 +304,9 @@ pub fn recursive_quotation_test() {
 
   let result = turtle.serialize(turtle_doc)
 
-  // Should have multiple levels of << >> nesting
-  should.be_true(contains(result, "<<<<<<"))
-  should.be_true(contains(result, ">>>"))
+  // Should have multiple levels of RDF 1.2 triple term nesting
+  should.be_true(contains(result, "<<( <<( <<( "))
+  should.equal(list.length(string.split(result, " )>>")), 4)
   should.be_true(contains(result, "RDF Specification"))
   should.be_true(contains(result, "2023-12-01"))
   should.be_true(contains(result, "\"yes\""))

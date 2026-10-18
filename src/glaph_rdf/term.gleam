@@ -55,6 +55,8 @@ pub type TermError {
   InvalidBlankNodeIdentifier(String)
   /// The provided string is not a valid BCP 47 language tag.
   InvalidLanguageTag(String)
+  /// The provided string is not an RDF 1.2 base direction (`ltr` or `rtl`).
+  InvalidBaseDirection(String)
   /// A literal cannot be used as a subject in RDF.
   InvalidSubjectTerm
   /// A literal or quoted triple cannot be used as a graph name.
@@ -85,17 +87,36 @@ pub type LanguageTag {
   LanguageTag(value: String)
 }
 
+/// The initial text direction of an RDF 1.2 directional language-tagged
+/// string. Serialized as `ltr` or `rtl` (always lowercase).
+pub type BaseDirection {
+  /// Left-to-right (`ltr`).
+  LeftToRight
+  /// Right-to-left (`rtl`).
+  RightToLeft
+}
+
 /// An RDF literal representing a value with optional language or datatype.
 ///
 /// Literals can be:
 /// - Simple: plain string values
-/// - Language-tagged: strings with BCP 47 language tags  
+/// - Language-tagged: strings with BCP 47 language tags (`rdf:langString`)
+/// - Directional language-tagged: strings with a language tag and a base
+///   direction (RDF 1.2, `rdf:dirLangString`)
 /// - Typed: values with explicit XML Schema datatypes
 pub type Literal {
   /// A simple literal with just a string value.
   SimpleLiteral(value: String)
   /// A literal with a string value and BCP 47 language tag.
   LanguageTaggedLiteral(value: String, tag: LanguageTag)
+  /// An RDF 1.2 literal with a string value, a BCP 47 language tag and a
+  /// base direction. Its datatype is `rdf:dirLangString`. It is a different
+  /// term from the `LanguageTaggedLiteral` with the same value and tag.
+  DirectionalLanguageTaggedLiteral(
+    value: String,
+    tag: LanguageTag,
+    direction: BaseDirection,
+  )
   /// A literal with a string value and explicit datatype IRI.
   TypedLiteral(value: String, datatype: NamedNode)
 }
@@ -103,7 +124,8 @@ pub type Literal {
 /// An RDF-star quoted triple that can be used as a subject or object.
 ///
 /// Triple terms enable making statements about statements (reification).
-/// They are serialized using << >> syntax in RDF-star formats.
+/// They are serialized as `<<( s p o )>>` in N-Triples, N-Quads, Turtle and
+/// TriG.
 /// 
 /// ## Example
 /// ```gleam
@@ -214,12 +236,13 @@ pub fn unsafe_named_node(value: String) -> NamedNode {
 ///
 /// Validates that the identifier follows RDF blank node identifier rules:
 /// - Starts with an underscore or letter
-/// - Followed by zero or more letters, digits, hyphens, or underscores
+/// - Followed by zero or more letters, digits, underscores or dots
+/// - Does not end with a dot
 ///
 /// ## Examples
 /// ```gleam
 /// blank_node("n1")      // Ok(BlankNode("n1"))
-/// blank_node("_:b42")   // Ok(BlankNode("_:b42"))
+/// blank_node("b.42")    // Ok(BlankNode("b.42"))
 /// blank_node("123")     // Error(InvalidBlankNodeIdentifier("123"))
 /// ```
 pub fn blank_node(identifier: String) -> Result(BlankNode, TermError) {
@@ -245,15 +268,22 @@ pub fn unsafe_blank_node(identifier: String) -> BlankNode {
 
 /// Create a language tag from a BCP 47 language tag string with validation.
 ///
-/// Validates and normalizes the language tag according to BCP 47 and RDF 1.2 rules.
-/// Converts to canonical lowercase form and validates structure including language,
-/// script, region, variants, and extensions.
+/// Validates the structure (language, extlang, script, region, variants,
+/// extensions, private use) according to BCP 47 and RDF 1.2 rules. Matching
+/// is ASCII case-insensitive, and the stored tag is normalized to BCP 47
+/// display case: script subtags in title case, two-letter region subtags in
+/// upper case, everything else in lower case. So `en-us`, `EN-US` and `en-US`
+/// all yield the same, equal `LanguageTag("en-US")`.
+///
+/// Turtle and TriG output keep this casing; the N-Triples and N-Quads
+/// writers lowercase the tag, as canonical N-Triples requires.
 ///
 /// ## Examples
 /// ```gleam
-/// language_tag("en-US")     // Ok(LanguageTag("en-us"))
-/// language_tag("zh-Hant")   // Ok(LanguageTag("zh-hant"))  
-/// language_tag("invalid")   // Error(InvalidLanguageTag("invalid"))
+/// language_tag("en-US")     // Ok(LanguageTag("en-US"))
+/// language_tag("en-us")     // Ok(LanguageTag("en-US"))
+/// language_tag("ZH-HANT")   // Ok(LanguageTag("zh-Hant"))
+/// language_tag("en--x")     // Error(InvalidLanguageTag("en--x"))
 /// ```
 pub fn language_tag(value: String) -> Result(LanguageTag, TermError) {
   let lower = string.lowercase(value)
@@ -292,11 +322,97 @@ pub fn language_literal(value: String, tag: LanguageTag) -> Literal {
   LanguageTaggedLiteral(value, tag)
 }
 
+/// Parse an RDF 1.2 base direction.
+///
+/// RDF 1.2 Concepts (section 3.4) requires the base direction to be one of
+/// the lowercase strings `ltr` or `rtl`, so matching is exact: `LTR` and
+/// `Rtl` are rejected, as in the W3C `langdir-bad-2` syntax tests. (Only
+/// the language tag part of `@tag--dir` is case-insensitive.)
+///
+/// ## Examples
+/// ```gleam
+/// base_direction("ltr")   // Ok(LeftToRight)
+/// base_direction("rtl")   // Ok(RightToLeft)
+/// base_direction("RTL")   // Error(InvalidBaseDirection("RTL"))
+/// base_direction("up")    // Error(InvalidBaseDirection("up"))
+/// ```
+pub fn base_direction(value: String) -> Result(BaseDirection, TermError) {
+  case value {
+    "ltr" -> Ok(LeftToRight)
+    "rtl" -> Ok(RightToLeft)
+    _ -> Error(InvalidBaseDirection(value))
+  }
+}
+
+/// The canonical (lowercase) string form of a base direction.
+///
+/// ## Examples
+/// ```gleam
+/// base_direction_to_string(LeftToRight)   // "ltr"
+/// base_direction_to_string(RightToLeft)   // "rtl"
+/// ```
+pub fn base_direction_to_string(direction: BaseDirection) -> String {
+  case direction {
+    LeftToRight -> "ltr"
+    RightToLeft -> "rtl"
+  }
+}
+
+/// Create an RDF 1.2 directional language-tagged string literal
+/// (datatype `rdf:dirLangString`).
+///
+/// Validate the parts first with `language_tag` and `base_direction`, or use
+/// `directional_language_literal_from_strings` to do both in one step.
+///
+/// ## Examples
+/// ```gleam
+/// directional_language_literal("Hello", LanguageTag("en"), LeftToRight)
+/// // -> DirectionalLanguageTaggedLiteral("Hello", LanguageTag("en"), LeftToRight)
+/// directional_language_literal("שלום", LanguageTag("he"), RightToLeft)
+/// // -> DirectionalLanguageTaggedLiteral("שלום", LanguageTag("he"), RightToLeft)
+/// ```
+pub fn directional_language_literal(
+  value: String,
+  tag: LanguageTag,
+  direction: BaseDirection,
+) -> Literal {
+  DirectionalLanguageTaggedLiteral(value, tag, direction)
+}
+
+/// Create an RDF 1.2 directional language-tagged string literal from an
+/// unvalidated language tag and base direction, validating both.
+///
+/// ## Examples
+/// ```gleam
+/// directional_language_literal_from_strings("Hello", "en-US", "ltr")
+/// // -> Ok(DirectionalLanguageTaggedLiteral("Hello", LanguageTag("en-US"), LeftToRight))
+/// directional_language_literal_from_strings("Hello", "en", "up")
+/// // -> Error(InvalidBaseDirection("up"))
+/// directional_language_literal_from_strings("Hello", "", "ltr")
+/// // -> Error(InvalidLanguageTag(""))
+/// ```
+pub fn directional_language_literal_from_strings(
+  value: String,
+  tag: String,
+  direction: String,
+) -> Result(Literal, TermError) {
+  use tag <- result.try(language_tag(tag))
+  use direction <- result.map(base_direction(direction))
+  DirectionalLanguageTaggedLiteral(value, tag, direction)
+}
+
 /// Create a typed literal with a specific datatype.
 ///
 /// Typed literals associate a string value with an IRI that identifies
 /// the datatype. Common datatypes include XSD types like integer, boolean,
 /// dateTime, etc.
+///
+/// Do not pass `rdf:langString` or `rdf:dirLangString` as the datatype. RDF
+/// requires a literal to have a language tag exactly when its datatype is one
+/// of those two, so such a literal is not well-formed RDF. This function does
+/// not check for it: the writers print it as `"x"^^rdf:langString`, and every
+/// parser in this library rejects that, as RDF 1.2 requires. Use
+/// `language_literal` or `directional_language_literal` instead.
 ///
 /// ## Examples
 /// ```gleam
@@ -871,6 +987,9 @@ fn is_valid_blank_node_identifier(identifier: String) -> Bool {
       is_valid_blank_head(first)
       && is_valid_blank_body(first)
       && list.all(rest, fn(char) { is_valid_blank_body(char) })
+      // '.' may appear inside a label but not at its end (BLANK_NODE_LABEL),
+      // or writers could not tell it from the statement terminator.
+      && !string.ends_with(identifier, ".")
   }
 }
 

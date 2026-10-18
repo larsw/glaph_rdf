@@ -70,7 +70,9 @@ pub type NQuadsError {
 /// }
 /// ```
 pub fn parse(text: String) -> Result(NQuadsDocument, NQuadsError) {
-  let lines = rdf_syntax.split_lines(text)
+  // One leading byte order mark is skipped, as the file readers do; any
+  // other U+FEFF is a syntax error.
+  let lines = rdf_syntax.split_lines(utf8.strip_bom(text))
   parse_lines(lines, 1, [])
   |> result.map(NQuadsDocument)
 }

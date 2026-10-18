@@ -355,7 +355,8 @@ pub fn serialize_iri_escaping_test() {
 
   let result = trig.serialize(doc)
 
-  // Verify proper IRI escaping
-  should.be_true(contains(result, "\\>"))
-  // Angle bracket escaped in IRI
+  // '>' cannot appear in an IRIREF, and Turtle/TriG have no "\\>" escape:
+  // it is written as a UCHAR, as in N-Triples.
+  should.be_true(contains(result, "\\u003E"))
+  should.be_false(contains(result, "\\>"))
 }

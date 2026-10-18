@@ -22,8 +22,10 @@ Gleam <3 Graph
   comparison regardless of serialization order or blank node naming.
 - **URI interoperability** – convert between IRIs, `NamedNode`s, and
   `gleam/uri.Uri` values, decoding percent-encoded Unicode only when needed.
-- **Comprehensive RDF serialization** – full W3C Turtle and TriG serializers with
-  parsing, intelligent prefix management, and support for all RDF 1.2 term types.
+- **RDF serialization** – Turtle, TriG, N-Triples and N-Quads writers and
+  parsers with intelligent prefix management and support for all RDF 1.2 term
+  types. The Turtle and TriG parsers cover the core grammar; see the Turtle
+  section below for the syntax they do not read yet.
 
 ## Installation
 
@@ -80,11 +82,34 @@ let assert Ok(tag) = glaph_rdf.language_tag("zh-Hant-tw")
 The returned value can be used with `glaph_rdf.language_literal/2` to attach
 language metadata to literals.
 
+RDF 1.2 directional language-tagged strings (datatype `rdf:dirLangString`)
+add a base direction, `ltr` or `rtl`:
+
+```gleam
+let assert Ok(tag) = glaph_rdf.language_tag("ar")
+let assert Ok(direction) = glaph_rdf.base_direction("rtl")
+let literal = glaph_rdf.directional_language_literal("مرحبا", tag, direction)
+// N-Triples / N-Quads / Turtle / TriG: "مرحبا"@ar--rtl
+```
+
+N-Triples, N-Quads, Turtle and TriG all read and write the `@tag--ltr` /
+`@tag--rtl` form. The language tag is case-insensitive, but the direction
+must be exactly `ltr` or `rtl` in lowercase, as RDF 1.2 requires: `@en--LTR`
+or `@en--up` is a parse error. A literal written with the datatype
+`rdf:langString` or `rdf:dirLangString` (`"x"^^rdf:dirLangString`) is also a
+parse error, because such literals must carry a language tag. `typed_literal`
+does not check for these two datatypes, so a literal built that way is written
+out as-is and cannot be read back; use `language_literal` or
+`directional_language_literal` instead.
+
 ## RDF Serialization Support
 
 ### Turtle Serializer
 
-The library includes a comprehensive **Turtle (Terse RDF Triple Language)** serializer that supports the full W3C Turtle specification:
+The library includes a comprehensive **Turtle (Terse RDF Triple Language)** serializer and parser. The writer can express every RDF 1.2 graph built from
+validated terms (numbers and booleans are written bare only when that form reads
+back as the same literal; anything else is quoted with `^^`); the parser reads the
+core Turtle grammar (see the limits listed below):
 
 ```gleam
 import glaph_rdf/serializers/turtle
@@ -121,14 +146,23 @@ let turtle_text = turtle.serialize(turtle_doc)
 ```
 
 **Turtle Features:**
-- **Full W3C Turtle compliance** with lexical analysis and recursive descent parsing
-- **Intelligent prefix management** - automatically uses prefixes when beneficial
-- **All RDF 1.2 term types** - IRIs, blank nodes, literals (simple, language-tagged, typed)
+- **Recursive descent parser** for directives, predicate and object lists, all
+  four string forms (`"…"`, `'…'`, `"""…"""`, `'''…'''`), numbers and booleans
+- **Intelligent prefix management** - automatically uses prefixes when beneficial;
+  `@prefix` lines are written sorted by label, so output is the same on Erlang
+  and JavaScript
+- **All RDF 1.2 term types** - IRIs, blank nodes, literals (simple,
+  language-tagged, directional `"x"@en--ltr`, typed) and triple terms
+  `<<( s p o )>>`
 - **Proper escaping** - handles strings, IRIs, and Unicode correctly
 - **Base URI support** - relative IRI resolution and `@base` directives
-- **RDF shortcuts** - uses `a` for `rdf:type`, supports collection syntax `( )`
+- **RDF shortcuts** - uses `a` for `rdf:type`
 - **Blank node labels** - preserves and generates valid blank node identifiers
 - **Comprehensive error reporting** - detailed parse errors with position information
+- **Not yet supported when parsing**: collections `( … )`, `[ … ]` blank nodes,
+  reified triples `<< … >>`, reifiers `s p o ~ r`, annotations `{| … |}`, the
+  RDF 1.2 version directive (`VERSION "1.2"` / `@version "1.2" .`) and
+  SPARQL-style `PREFIX` / `BASE`
 
 ### TriG Serializer  
 
@@ -188,7 +222,8 @@ let trig_text = trig.serialize(trig_doc)
 - **Default graph handling** - triples without explicit graph context
 - **Full Turtle compatibility** - inherits all Turtle features (prefixes, base URIs, shortcuts)
 - **Mixed datasets** - seamlessly handles both default and named graph content
-- **Turtle fallback parsing** - can parse regular Turtle documents as TriG
+- **Graph block parsing** - reads `{ … }`, `label { … }` and `GRAPH label { … }`
+  blocks, and plain Turtle documents as the default graph
 
 ### Parsing Support
 
@@ -236,7 +271,7 @@ case turtle.parse_graph_file("data/ontology.ttl") {
 }
 
 // Write RDF to file
-let prefixes = dict.from_list([("ex", "http://example.org/")])
+let prefixes = dict.from_list([#("ex", "http://example.org/")])
 case turtle.serialize_graph_to_file(my_graph, None, prefixes, "output/data.ttl") {
   Ok(Nil) -> // File written successfully
   Error(error) -> // Handle file write error

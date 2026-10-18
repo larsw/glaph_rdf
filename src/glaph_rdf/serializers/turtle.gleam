@@ -4,6 +4,10 @@
 //// Serialization /////////////////////////////////////////////////////////////
 
 import glaph_rdf/graph
+import glaph_rdf/internal/rdf_syntax
+import glaph_rdf/internal/turtle_names.{
+  type NumberKind, DecimalNumber, DoubleNumber, IntegerNumber,
+}
 import glaph_rdf/internal/utf8
 import glaph_rdf/statement
 import glaph_rdf/term
@@ -30,7 +34,7 @@ const xsd_boolean = "http://www.w3.org/2001/XMLSchema#boolean"
 /// Represents a parsed or serializable Turtle document containing all the
 /// components: optional base IRI for resolving relative references, namespace
 /// prefixes for abbreviated IRIs, and the RDF graph containing the actual data.
-/// Supports RDF-star quoted triples with `<< >>` syntax.
+/// Supports RDF 1.2 triple terms with `<<( s p o )>>` syntax.
 ///
 /// ## Examples
 /// ```gleam
@@ -65,12 +69,6 @@ pub type TurtleError {
   TurtleError(message: String, position: Int)
 }
 
-type NumberKind {
-  IntegerNumber
-  DecimalNumber
-  DoubleNumber
-}
-
 type TokenKind {
   PrefixDirective
   BaseDirective
@@ -87,6 +85,14 @@ type TokenKind {
   NumberLiteral(NumberKind, String)
   BooleanLiteral(Bool)
   Word(String)
+  /// `<<(`, the start of a triple term.
+  TripleTermStart
+  /// `)>>`, the end of a triple term.
+  TripleTermEnd
+  /// `{`, the start of a TriG graph block.
+  GraphStart
+  /// `}`, the end of a TriG graph block.
+  GraphEnd
 }
 
 type Token {
@@ -103,9 +109,14 @@ type ParserState {
 
 /// Parse a Turtle document from text into a structured representation.
 ///
-/// Parses complete Turtle syntax including base declarations, prefix definitions,
-/// and RDF triples. Supports RDF-star quoted triples with `<< >>` syntax for
-/// metadata and provenance. Returns detailed error information on parse failures.
+/// Parses base and prefix directives (anywhere between statements), triples
+/// with predicate and object lists, IRIs, prefixed names, blank node labels,
+/// all four string forms (`"..."`, `'...'`, `"""..."""`, `'''...'''`),
+/// numbers, booleans, language tags, RDF 1.2 directional language tags
+/// (`"x"@en--ltr`), datatypes and RDF 1.2 triple terms (`<<( s p o )>>`).
+/// Collections, `[ ... ]` blank nodes, reified triples (`<< ... >>`) and
+/// annotations (`{| ... |}`) are not supported yet and give an error.
+/// Returns detailed error information on parse failures.
 ///
 /// ## Examples
 /// ```gleam
@@ -122,7 +133,9 @@ type ParserState {
 /// }
 /// ```
 pub fn parse(text: String) -> Result(TurtleDocument, TurtleError) {
-  tokenize(text)
+  // One leading byte order mark is skipped, as the file readers do; any
+  // other U+FEFF is a syntax error.
+  tokenize(utf8.strip_bom(text))
   |> result.try(parse_tokens)
 }
 
@@ -154,7 +167,7 @@ pub fn parse_graph(text: String) -> Result(graph.Graph, TurtleError) {
 ///
 /// Converts a structured Turtle document back to valid Turtle syntax text.
 /// Automatically handles IRI escaping, prefix usage, literal formatting, and
-/// RDF-star quoted triple serialization with `<< >>` syntax. Output is
+/// RDF 1.2 triple term serialization with `<<( s p o )>>` syntax. Output is
 /// well-formatted and compliant with W3C Turtle specifications.
 ///
 /// ## Examples
@@ -207,8 +220,8 @@ pub fn serialize_graph(
 /// Parse a Turtle document from a file into a structured representation.
 ///
 /// Reads a Turtle file and parses its contents including base declarations, 
-/// prefix definitions, and RDF triples. Supports RDF-star quoted triples with 
-/// `<< >>` syntax. Returns detailed error information on file read failures 
+/// prefix definitions, and RDF triples. Supports RDF 1.2 triple terms with
+/// `<<( s p o )>>` syntax. Returns detailed error information on file read failures 
 /// or parse errors.
 ///
 /// ## Examples
@@ -335,7 +348,13 @@ pub fn serialize_graph_to_file(
 }
 
 fn tokenize(text: String) -> Result(List(Token), TurtleError) {
-  tokenize_loop(LexerState(string.to_graphemes(text), 0), [])
+  // The lexer works on codepoints, not grapheme clusters: the grammar is
+  // defined on codepoints, and clusters (such as a combining accent after a
+  // ':' or CR LF) would otherwise hide characters from the lexer.
+  let chars =
+    string.to_utf_codepoints(text)
+    |> list.map(fn(codepoint) { string.from_utf_codepoints([codepoint]) })
+  tokenize_loop(LexerState(chars, 0), [])
 }
 
 fn tokenize_loop(
@@ -360,19 +379,43 @@ fn next_token(state: LexerState) -> Result(#(Token, LexerState), TurtleError) {
       case chars {
         [] -> Error(TurtleError("Unexpected end of input", pos))
         ["@", ..rest] -> lex_directive_or_lang(LexerState(rest, pos + 1), pos)
+        [".", next, ..] ->
+          case is_ascii_digit(next) {
+            True -> lex_number(state)
+            False ->
+              Ok(#(Token(Dot, pos), LexerState(list.drop(chars, 1), pos + 1)))
+          }
         [".", ..rest] -> Ok(#(Token(Dot, pos), LexerState(rest, pos + 1)))
         [";", ..rest] -> Ok(#(Token(Semicolon, pos), LexerState(rest, pos + 1)))
         [",", ..rest] -> Ok(#(Token(Comma, pos), LexerState(rest, pos + 1)))
         ["^", ..rest] -> lex_hat(LexerState(rest, pos + 1), pos)
+        ["<", "<", "(", ..rest] ->
+          Ok(#(Token(TripleTermStart, pos), LexerState(rest, pos + 3)))
+        ["<", "<", ..] ->
+          Error(TurtleError(
+            "Reified triples (<< ... >>) are not supported; write a triple term as <<( s p o )>>",
+            pos,
+          ))
+        [")", ">", ">", ..rest] ->
+          Ok(#(Token(TripleTermEnd, pos), LexerState(rest, pos + 3)))
+        ["{", ..rest] ->
+          Ok(#(Token(GraphStart, pos), LexerState(rest, pos + 1)))
+        ["}", ..rest] -> Ok(#(Token(GraphEnd, pos), LexerState(rest, pos + 1)))
         ["<", ..] -> lex_iri(state)
-        ["\"", ..] -> lex_string(state)
+        ["\"", "\"", "\"", ..rest] ->
+          lex_string(LexerState(rest, pos + 3), pos, "\"", True)
+        ["'", "'", "'", ..rest] ->
+          lex_string(LexerState(rest, pos + 3), pos, "'", True)
+        ["\"", ..rest] ->
+          lex_string(LexerState(rest, pos + 1), pos, "\"", False)
+        ["'", ..rest] -> lex_string(LexerState(rest, pos + 1), pos, "'", False)
         [":", ..] -> lex_prefixed_empty(state)
         ["_", ..rest] -> lex_blank(LexerState(rest, pos + 1), pos)
         [char, ..] ->
           case is_number_start(char) {
             True -> lex_number(state)
             False ->
-              case is_name_start(char) {
+              case turtle_names.is_prefix_start_char(char) {
                 True -> lex_name_or_prefixed(state)
                 False -> Error(TurtleError("Unexpected character", pos))
               }
@@ -381,37 +424,24 @@ fn next_token(state: LexerState) -> Result(#(Token, LexerState), TurtleError) {
   }
 }
 
+/// Lexes what follows an `@`: the `@prefix` / `@base` keywords, or a
+/// `LANG_DIR` suffix (`en`, `en-US`, `en--ltr`). The suffix is validated by
+/// the parser with `rdf_syntax.lang_dir_literal`, so all four formats report
+/// the same errors.
 fn lex_directive_or_lang(
   state: LexerState,
   pos: Int,
 ) -> Result(#(Token, LexerState), TurtleError) {
-  case state {
-    LexerState(chars, _) -> {
-      let keyword = string.concat(list.take(chars, 6))
-      case
-        string.starts_with(keyword, "prefix"),
-        string.starts_with(keyword, "base")
-      {
-        True, _ -> {
-          let rest = list.drop(chars, 6)
-          Ok(#(Token(PrefixDirective, pos), LexerState(rest, pos + 6)))
-        }
-        _, True -> {
-          let rest = list.drop(chars, 4)
-          Ok(#(Token(BaseDirective, pos), LexerState(rest, pos + 4)))
-        }
-        _, _ ->
-          take_while(state, is_lang_char)
-          |> result.try(fn(pair) {
-            let #(tag, state) = pair
-            case tag {
-              "" -> Error(TurtleError("Expected language tag", pos))
-              _ -> Ok(#(Token(LangTag(tag), pos - 1), state))
-            }
-          })
-      }
+  take_while(state, is_lang_char)
+  |> result.try(fn(pair) {
+    let #(text, rest) = pair
+    case text {
+      "prefix" -> Ok(#(Token(PrefixDirective, pos), rest))
+      "base" -> Ok(#(Token(BaseDirective, pos), rest))
+      "" -> Error(TurtleError("Expected language tag", pos))
+      _ -> Ok(#(Token(LangTag(text), pos), rest))
     }
-  }
+  })
 }
 
 fn lex_hat(
@@ -466,43 +496,70 @@ fn collect_iri(
   }
 }
 
-fn lex_string(state: LexerState) -> Result(#(Token, LexerState), TurtleError) {
-  let LexerState(_, pos) = state
-  advance_char(state)
-  |> result.try(fn(state2) {
-    collect_string(state2, [])
-    |> result.map(fn(pair) {
-      let #(value, state3) = pair
-      #(Token(StringLiteral(value), pos), state3)
-    })
+/// Lexes a string body after its opening quote (`"`, `'`, `"""` or `'''`).
+/// `pos` is the position of the opening quote.
+fn lex_string(
+  state: LexerState,
+  pos: Int,
+  quote: String,
+  long: Bool,
+) -> Result(#(Token, LexerState), TurtleError) {
+  let collected = case long {
+    True -> collect_long_string(state, quote, [])
+    False -> collect_string(state, quote, [])
+  }
+  collected
+  |> result.map(fn(pair) {
+    let #(value, state) = pair
+    #(Token(StringLiteral(value), pos), state)
   })
 }
 
+/// `STRING_LITERAL_QUOTE` / `STRING_LITERAL_SINGLE_QUOTE`: no raw line
+/// breaks.
 fn collect_string(
   state: LexerState,
+  quote: String,
   acc: List(String),
 ) -> Result(#(String, LexerState), TurtleError) {
-  case state {
-    LexerState(chars, pos) ->
-      case list.is_empty(chars) {
-        True -> Error(TurtleError("Unterminated string", pos))
-        False ->
-          case chars {
-            ["\"", ..rest] ->
-              Ok(#(string.concat(list.reverse(acc)), LexerState(rest, pos + 1)))
-            ["\\", ..rest] ->
-              parse_escape(LexerState(rest, pos + 1))
-              |> result.try(fn(pair) {
-                let #(char, state) = pair
-                collect_string(state, [char, ..acc])
-              })
-            ["\n", ..] ->
-              Error(TurtleError("Line break not allowed in string", pos))
-            [char, ..rest] ->
-              collect_string(LexerState(rest, pos + 1), [char, ..acc])
-            [] -> Error(TurtleError("Unterminated string", pos))
-          }
-      }
+  let LexerState(chars, pos) = state
+  case chars {
+    [char, ..rest] if char == quote ->
+      Ok(#(string.concat(list.reverse(acc)), LexerState(rest, pos + 1)))
+    ["\\", ..rest] ->
+      parse_escape(LexerState(rest, pos + 1))
+      |> result.try(fn(pair) {
+        let #(char, state) = pair
+        collect_string(state, quote, [char, ..acc])
+      })
+    ["\n", ..] | ["\r", ..] ->
+      Error(TurtleError("Line break not allowed in string", pos))
+    [char, ..rest] ->
+      collect_string(LexerState(rest, pos + 1), quote, [char, ..acc])
+    [] -> Error(TurtleError("Unterminated string", pos))
+  }
+}
+
+/// `STRING_LITERAL_LONG_QUOTE` / `STRING_LITERAL_LONG_SINGLE_QUOTE`: ends at
+/// the first three unescaped quotes; raw line breaks are allowed.
+fn collect_long_string(
+  state: LexerState,
+  quote: String,
+  acc: List(String),
+) -> Result(#(String, LexerState), TurtleError) {
+  let LexerState(chars, pos) = state
+  case chars {
+    [a, b, c, ..rest] if a == quote && b == quote && c == quote ->
+      Ok(#(string.concat(list.reverse(acc)), LexerState(rest, pos + 3)))
+    ["\\", ..rest] ->
+      parse_escape(LexerState(rest, pos + 1))
+      |> result.try(fn(pair) {
+        let #(char, state) = pair
+        collect_long_string(state, quote, [char, ..acc])
+      })
+    [char, ..rest] ->
+      collect_long_string(LexerState(rest, pos + 1), quote, [char, ..acc])
+    [] -> Error(TurtleError("Unterminated long string", pos))
   }
 }
 
@@ -520,7 +577,10 @@ fn parse_escape(
                 "t" -> Ok(#("\t", LexerState(rest, pos + 1)))
                 "n" -> Ok(#("\n", LexerState(rest, pos + 1)))
                 "r" -> Ok(#("\r", LexerState(rest, pos + 1)))
+                "b" -> Ok(#("\u{0008}", LexerState(rest, pos + 1)))
+                "f" -> Ok(#("\u{000C}", LexerState(rest, pos + 1)))
                 "\"" -> Ok(#("\"", LexerState(rest, pos + 1)))
+                "'" -> Ok(#("'", LexerState(rest, pos + 1)))
                 "\\" -> Ok(#("\\", LexerState(rest, pos + 1)))
                 "u" -> parse_unicode(LexerState(rest, pos + 1), 4)
                 "U" -> parse_unicode(LexerState(rest, pos + 1), 8)
@@ -559,12 +619,10 @@ fn lex_prefixed_empty(
 ) -> Result(#(Token, LexerState), TurtleError) {
   let LexerState(_, pos) = state
   advance_char(state)
-  |> result.try(fn(state2) {
-    take_while(state2, is_name_char)
-    |> result.try(fn(pair) {
-      let #(local, state3) = pair
-      #(Token(Prefixed("", local), pos), state3) |> Ok
-    })
+  |> result.try(lex_local)
+  |> result.map(fn(pair) {
+    let #(local, state) = pair
+    #(Token(Prefixed("", local), pos), state)
   })
 }
 
@@ -575,73 +633,170 @@ fn lex_blank(
   case state {
     LexerState(chars, _) ->
       case chars {
-        [":", ..rest] ->
-          take_while(LexerState(rest, pos + 2), is_name_char)
-          |> result.try(fn(pair) {
-            let #(label, state) = pair
-            case label {
-              "" -> Error(TurtleError("Expected blank node label", pos))
-              _ -> #(Token(BlankLabel(label), pos - 1), state) |> Ok
-            }
-          })
+        [":", ..rest] -> {
+          // A label may contain '.' but never ends with one: a trailing '.'
+          // is the statement terminator.
+          let #(label, state) = lex_blank_label(LexerState(rest, pos + 2), [])
+          case label {
+            "" -> Error(TurtleError("Expected blank node label", pos))
+            _ -> #(Token(BlankLabel(label), pos - 1), state) |> Ok
+          }
+        }
         _ -> Error(TurtleError("Invalid blank node", pos))
       }
   }
 }
 
+/// Lexes the longest `INTEGER`, `DECIMAL` or `DOUBLE` at the cursor. A '.'
+/// not followed by a digit or an exponent ends the statement instead.
+fn lex_blank_label(
+  state: LexerState,
+  acc: List(String),
+) -> #(String, LexerState) {
+  case state {
+    LexerState([char, ..rest], pos) ->
+      case is_name_char(char) || { acc != [] && char == "." } {
+        True -> lex_blank_label(LexerState(rest, pos + 1), [char, ..acc])
+        False -> give_back_trailing_dots(acc, state)
+      }
+    LexerState([], _) -> give_back_trailing_dots(acc, state)
+  }
+}
+
 fn lex_number(state: LexerState) -> Result(#(Token, LexerState), TurtleError) {
-  let LexerState(_, pos) = state
-  take_while(state, is_number_char)
-  |> result.map(fn(pair) {
-    let #(text, state2) = pair
-    let kind = classify_number(text)
-    #(Token(NumberLiteral(kind, text), pos), state2)
-  })
+  let LexerState(chars, pos) = state
+  case turtle_names.scan_number(chars) {
+    Ok(#(kind, length)) -> {
+      let text = string.concat(list.take(chars, length))
+      Ok(#(
+        Token(NumberLiteral(kind, text), pos),
+        LexerState(list.drop(chars, length), pos + length),
+      ))
+    }
+    Error(Nil) -> Error(TurtleError("Invalid number", pos))
+  }
 }
 
 fn lex_name_or_prefixed(
   state: LexerState,
 ) -> Result(#(Token, LexerState), TurtleError) {
   let LexerState(_, pos) = state
-  take_while(state, is_name_char)
-  |> result.try(fn(pair) {
-    let #(name, state) = pair
-    case state {
-      LexerState(chars, next_pos) ->
-        case chars {
-          [":", ..rest] ->
-            take_while(LexerState(rest, next_pos + 1), is_name_char)
-            |> result.try(fn(pair2) {
-              let #(local, state) = pair2
-              case local {
-                "" -> {
-                  let allow_empty = case state {
-                    LexerState(chars2, _) ->
-                      case chars2 {
-                        [] -> True
-                        [char2, ..] -> is_whitespace_char(char2) || char2 == "<"
-                      }
-                  }
-                  case allow_empty {
-                    True -> #(Token(Prefixed(name, local), pos), state) |> Ok
-                    False -> {
-                      let LexerState(_, lp_pos) = state
-                      Error(TurtleError("Expected local part", lp_pos))
-                    }
-                  }
-                }
-                _ -> #(Token(Prefixed(name, local), pos), state) |> Ok
-              }
-            })
-          _ ->
-            case string.lowercase(name) {
-              "true" -> Ok(#(Token(BooleanLiteral(True), pos), state))
-              "false" -> Ok(#(Token(BooleanLiteral(False), pos), state))
-              _ -> Ok(#(Token(Word(name), pos), state))
-            }
-        }
+  let #(name, state) = lex_prefix_name(state, [])
+  case state {
+    LexerState([":", ..rest], next_pos) ->
+      lex_local(LexerState(rest, next_pos + 1))
+      |> result.map(fn(pair) {
+        let #(local, state) = pair
+        #(Token(Prefixed(name, local), pos), state)
+      })
+    _ ->
+      // Turtle keywords other than PREFIX and BASE are case-sensitive.
+      case name {
+        "true" -> Ok(#(Token(BooleanLiteral(True), pos), state))
+        "false" -> Ok(#(Token(BooleanLiteral(False), pos), state))
+        _ -> Ok(#(Token(Word(name), pos), state))
+      }
+  }
+}
+
+/// Reads the rest of a PN_PREFIX (or a keyword) after its first character
+/// was checked. Trailing dots are left for the next token.
+fn lex_prefix_name(
+  state: LexerState,
+  acc: List(String),
+) -> #(String, LexerState) {
+  case state {
+    LexerState([char, ..rest], pos) ->
+      case acc == [] || turtle_names.is_prefix_char(char) {
+        True -> lex_prefix_name(LexerState(rest, pos + 1), [char, ..acc])
+        False -> give_back_trailing_dots(acc, state)
+      }
+    LexerState([], _) -> give_back_trailing_dots(acc, state)
+  }
+}
+
+fn give_back_trailing_dots(
+  acc: List(String),
+  state: LexerState,
+) -> #(String, LexerState) {
+  case acc {
+    [".", ..rest] -> {
+      let LexerState(chars, pos) = state
+      give_back_trailing_dots(rest, LexerState([".", ..chars], pos - 1))
     }
-  })
+    _ -> #(string.concat(list.reverse(acc)), state)
+  }
+}
+
+/// A decoded piece of a local name, whether it was an unescaped '.', and the
+/// lexer state before it (to give trailing dots back to the next token).
+type LocalPiece {
+  LocalPiece(text: String, bare_dot: Bool, before: LexerState)
+}
+
+/// Reads a PN_LOCAL (possibly empty) after the ':' of a prefixed name.
+/// `PN_LOCAL_ESC` escapes are decoded (`\/` is '/'), while `%XX` sequences are
+/// kept as they are, as the Turtle grammar requires.
+fn lex_local(state: LexerState) -> Result(#(String, LexerState), TurtleError) {
+  lex_local_loop(state, [])
+}
+
+fn lex_local_loop(
+  state: LexerState,
+  acc: List(LocalPiece),
+) -> Result(#(String, LexerState), TurtleError) {
+  let LexerState(chars, pos) = state
+  case chars {
+    ["%", high, low, ..rest] ->
+      case is_hex_digit(high) && is_hex_digit(low) {
+        True ->
+          lex_local_loop(LexerState(rest, pos + 3), [
+            LocalPiece("%" <> high <> low, False, state),
+            ..acc
+          ])
+        False -> Error(TurtleError("Invalid percent escape in local name", pos))
+      }
+    ["%", ..] -> Error(TurtleError("Invalid percent escape in local name", pos))
+    ["\\", char, ..rest] ->
+      case turtle_names.is_local_escape_char(char) {
+        True ->
+          lex_local_loop(LexerState(rest, pos + 2), [
+            LocalPiece(char, False, state),
+            ..acc
+          ])
+        False -> Error(TurtleError("Invalid escape in local name", pos))
+      }
+    ["\\"] -> Error(TurtleError("Invalid escape in local name", pos))
+    [char, ..rest] -> {
+      let accepted = case acc {
+        [] -> turtle_names.is_local_start_char(char)
+        _ -> char == "." || turtle_names.is_local_char(char)
+      }
+      case accepted {
+        True ->
+          lex_local_loop(LexerState(rest, pos + 1), [
+            LocalPiece(char, char == ".", state),
+            ..acc
+          ])
+        False -> Ok(finish_local(acc, state))
+      }
+    }
+    [] -> Ok(finish_local(acc, state))
+  }
+}
+
+fn finish_local(
+  acc: List(LocalPiece),
+  state: LexerState,
+) -> #(String, LexerState) {
+  case acc {
+    [LocalPiece(bare_dot: True, before:, ..), ..rest] ->
+      finish_local(rest, before)
+    _ -> #(
+      acc |> list.map(fn(piece) { piece.text }) |> list.reverse |> string.concat,
+      state,
+    )
+  }
 }
 
 fn skip_ws(state: LexerState) -> LexerState {
@@ -747,22 +902,6 @@ fn take_exact_loop(
   }
 }
 
-fn classify_number(text: String) -> NumberKind {
-  let lower = string.lowercase(text)
-  case string.contains(lower, "e") {
-    True -> DoubleNumber
-    False ->
-      case string.contains(lower, ".") {
-        True -> DecimalNumber
-        False -> IntegerNumber
-      }
-  }
-}
-
-fn is_number_char(char: String) -> Bool {
-  string.contains("0123456789+-.eE", char)
-}
-
 fn is_number_start(char: String) -> Bool {
   string.contains("0123456789+-", char)
 }
@@ -776,61 +915,229 @@ fn is_name_char(char: String) -> Bool {
   is_name_start(char) || string.contains("0123456789-", char)
 }
 
+/// Characters of a `LANG_DIR` suffix: ASCII letters, digits and `-`.
 fn is_lang_char(char: String) -> Bool {
-  let lower = string.lowercase(char)
-  string.contains("abcdefghijklmnopqrstuvwxyz", lower) || char == "-"
+  char == "-" || is_ascii_letter(char) || is_ascii_digit(char)
 }
 
 fn is_hex_digit(char: String) -> Bool {
   string.contains("0123456789abcdefABCDEF", char)
 }
 
+/// Which grammar the statement parser follows: TriG adds graph blocks.
+type Syntax {
+  TurtleSyntax
+  TrigSyntax
+}
+
+/// The directives in effect and the statements read so far (in reverse
+/// order while parsing).
+type Statements {
+  Statements(
+    base: Option(String),
+    prefixes: dict.Dict(String, String),
+    quads: List(statement.Quad),
+  )
+}
+
 fn parse_tokens(tokens: List(Token)) -> Result(TurtleDocument, TurtleError) {
-  parse_directives(ParserState(tokens), None, dict.new())
-  |> result.try(fn(triple) {
-    let #(base, prefixes, state) = triple
-    parse_triples(state, base, prefixes, [])
-    |> result.try(fn(pair2) {
-      let #(triples, state2) = pair2
-      let ParserState(rest) = state2
-      case rest {
-        [] ->
-          Ok(TurtleDocument(
-            base: base,
-            prefixes: prefixes,
-            graph: graph.from_list(list.reverse(triples)),
-          ))
-        [Token(_, pos), ..] ->
-          Error(TurtleError("Unexpected tokens after triples", pos))
+  parse_statements(
+    ParserState(tokens),
+    TurtleSyntax,
+    Statements(None, dict.new(), []),
+  )
+  |> result.map(fn(parsed) {
+    TurtleDocument(
+      base: parsed.base,
+      prefixes: parsed.prefixes,
+      graph: graph.from_list(list.map(parsed.quads, statement.triple_from_quad)),
+    )
+  })
+}
+
+/// Parse a TriG document into its base, prefixes and quads. This is the
+/// Turtle parser with TriG graph blocks (`{ ... }`, `label { ... }` and
+/// `GRAPH label { ... }`) enabled; the TriG module wraps it in its own
+/// document and error types. One leading byte order mark is skipped.
+///
+/// ## Examples
+/// ```gleam
+/// parse_trig("<http://ex.org/g> { <http://ex.org/s> <http://ex.org/p> \"o\"@en--ltr }")
+/// // -> Ok(#(None, dict.new(), [quad in graph <http://ex.org/g>]))
+/// ```
+@internal
+pub fn parse_trig(
+  text: String,
+) -> Result(
+  #(Option(String), dict.Dict(String, String), List(statement.Quad)),
+  TurtleError,
+) {
+  tokenize(utf8.strip_bom(text))
+  |> result.try(fn(tokens) {
+    parse_statements(
+      ParserState(tokens),
+      TrigSyntax,
+      Statements(None, dict.new(), []),
+    )
+  })
+  |> result.map(fn(parsed) { #(parsed.base, parsed.prefixes, parsed.quads) })
+}
+
+/// Reads directives and statements until the input ends. Directives may
+/// appear between statements and apply to everything after them.
+fn parse_statements(
+  state: ParserState,
+  syntax: Syntax,
+  parsed: Statements,
+) -> Result(Statements, TurtleError) {
+  case peek(state), syntax {
+    None, _ -> Ok(Statements(..parsed, quads: list.reverse(parsed.quads)))
+    Some(Token(PrefixDirective, _)), _ ->
+      parse_prefix(pop(state))
+      |> result.try(fn(found) {
+        let #(prefix, iri, state) = found
+        let prefixes = dict.insert(parsed.prefixes, prefix, iri)
+        parse_statements(state, syntax, Statements(..parsed, prefixes:))
+      })
+    Some(Token(BaseDirective, _)), _ ->
+      parse_base(pop(state))
+      |> result.try(fn(found) {
+        let #(iri, state) = found
+        parse_statements(state, syntax, Statements(..parsed, base: Some(iri)))
+      })
+    Some(Token(GraphStart, _)), TrigSyntax ->
+      parse_graph_block(drop_one(state), term.DefaultGraph, parsed)
+      |> result.try(fn(found) {
+        let #(parsed, state) = found
+        parse_statements(state, syntax, parsed)
+      })
+    Some(Token(Word(word), pos)), TrigSyntax ->
+      case string.uppercase(word) {
+        "GRAPH" -> parse_labelled_graph(drop_one(state), syntax, parsed)
+        _ -> Error(TurtleError("Expected subject", pos))
       }
+    Some(_), TrigSyntax ->
+      case state {
+        ParserState([_, Token(GraphStart, _), ..]) ->
+          parse_labelled_graph(state, syntax, parsed)
+        _ -> parse_default_statement(state, syntax, parsed)
+      }
+    Some(_), TurtleSyntax -> parse_default_statement(state, syntax, parsed)
+  }
+}
+
+/// A `triples '.'` statement outside any graph block.
+fn parse_default_statement(
+  state: ParserState,
+  syntax: Syntax,
+  parsed: Statements,
+) -> Result(Statements, TurtleError) {
+  parse_triples_statement(state, parsed.base, parsed.prefixes)
+  |> result.try(fn(found) {
+    let #(triples, state) = found
+    consume_dot(state)
+    |> result.try(fn(state) {
+      let parsed = add_quads(parsed, triples, term.DefaultGraph)
+      parse_statements(state, syntax, parsed)
     })
   })
 }
 
-fn parse_directives(
+/// `label { ... }` (the optional `GRAPH` keyword already consumed).
+fn parse_labelled_graph(
   state: ParserState,
+  syntax: Syntax,
+  parsed: Statements,
+) -> Result(Statements, TurtleError) {
+  consume_token(state, fn(token) {
+    graph_label(token, parsed.base, parsed.prefixes)
+  })
+  |> result.try(fn(found) {
+    let #(name, state) = found
+    consume_token(state, fn(token) {
+      case token {
+        Token(GraphStart, _) -> Ok(Nil)
+        _ ->
+          Error(TurtleError(
+            "Expected '{' after the graph name",
+            token_position(token),
+          ))
+      }
+    })
+    |> result.try(fn(found) {
+      let #(_, state) = found
+      parse_graph_block(state, name, parsed)
+    })
+    |> result.try(fn(found) {
+      let #(parsed, state) = found
+      parse_statements(state, syntax, parsed)
+    })
+  })
+}
+
+fn graph_label(
+  token: Token,
   base: Option(String),
   prefixes: dict.Dict(String, String),
-) -> Result(
-  #(Option(String), dict.Dict(String, String), ParserState),
-  TurtleError,
-) {
-  case peek(state) {
-    None -> Ok(#(base, prefixes, state))
-    Some(Token(PrefixDirective, _)) ->
-      parse_prefix(pop(state))
-      |> result.try(fn(pair) {
-        let #(prefix, iri, state) = pair
-        parse_directives(state, base, dict.insert(prefixes, prefix, iri))
+) -> Result(term.GraphName, TurtleError) {
+  case token {
+    Token(IriRef(iri), pos) ->
+      apply_base(iri, base, pos)
+      |> result.try(fn(resolved) {
+        term.named_node(resolved)
+        |> result.map_error(fn(_) { TurtleError("Invalid graph name", pos) })
       })
-    Some(Token(BaseDirective, _)) ->
-      parse_base(pop(state))
-      |> result.try(fn(pair) {
-        let #(iri, state) = pair
-        parse_directives(state, Some(iri), prefixes)
+      |> result.map(term.NamedGraph)
+    Token(Prefixed(prefix, local), pos) ->
+      resolve_prefixed(prefixes, prefix, local, pos)
+      |> result.try(fn(iri) {
+        term.named_node(iri)
+        |> result.map_error(fn(_) { TurtleError("Invalid graph name", pos) })
       })
-    _ -> Ok(#(base, prefixes, state))
+      |> result.map(term.NamedGraph)
+    Token(BlankLabel(label), pos) ->
+      term.blank_node(label)
+      |> result.map_error(fn(_) { TurtleError("Invalid blank node", pos) })
+      |> result.map(term.BlankGraph)
+    _ -> Error(TurtleError("Expected graph name", token_position(token)))
   }
+}
+
+/// The statements of a graph block after its `{`, up to and including the
+/// `}`. The `.` after the last statement is optional.
+fn parse_graph_block(
+  state: ParserState,
+  name: term.GraphName,
+  parsed: Statements,
+) -> Result(#(Statements, ParserState), TurtleError) {
+  case peek(state) {
+    Some(Token(GraphEnd, _)) -> Ok(#(parsed, drop_one(state)))
+    None -> Error(TurtleError("Expected '}' to close the graph block", -1))
+    Some(_) ->
+      parse_triples_statement(state, parsed.base, parsed.prefixes)
+      |> result.try(fn(found) {
+        let #(triples, state) = found
+        let parsed = add_quads(parsed, triples, name)
+        case peek(state) {
+          Some(Token(Dot, _)) ->
+            parse_graph_block(drop_one(state), name, parsed)
+          Some(Token(GraphEnd, _)) -> Ok(#(parsed, drop_one(state)))
+          Some(token) ->
+            Error(TurtleError("Expected '.' or '}'", token_position(token)))
+          None ->
+            Error(TurtleError("Expected '}' to close the graph block", -1))
+        }
+      })
+  }
+}
+
+fn add_quads(
+  parsed: Statements,
+  triples: List(statement.Triple),
+  name: term.GraphName,
+) -> Statements {
+  let quads = list.map(triples, statement.quad(_, name))
+  Statements(..parsed, quads: list.append(quads, parsed.quads))
 }
 
 fn parse_prefix(
@@ -842,7 +1149,14 @@ fn parse_prefix(
     consume_token(state, fn(token) {
       case token {
         Token(PrefixLabel(label), _) -> Ok(label)
-        Token(Prefixed(prefix, _), _) -> Ok(prefix)
+        // The grammar wants PNAME_NS here: a label and ':' with no local
+        // part, so `@prefix ex:a <...>` is a syntax error.
+        Token(Prefixed(prefix, ""), _) -> Ok(prefix)
+        Token(Prefixed(_, _), pos) ->
+          Error(TurtleError(
+            "Expected a prefix label ending in ':' with no local name",
+            pos,
+          ))
         _ -> Error(TurtleError("Expected prefix label", token_position(token)))
       }
     })
@@ -873,26 +1187,8 @@ fn parse_base(
   })
 }
 
-fn parse_triples(
-  state: ParserState,
-  base: Option(String),
-  prefixes: dict.Dict(String, String),
-  acc: List(statement.Triple),
-) -> Result(#(List(statement.Triple), ParserState), TurtleError) {
-  case peek(state) {
-    None -> Ok(#(acc, state))
-    Some(Token(Dot, _)) -> Ok(#(acc, state))
-    Some(Token(Semicolon, _)) -> Ok(#(acc, state))
-    Some(_) ->
-      parse_triple(state, base, prefixes)
-      |> result.try(fn(pair) {
-        let #(triples, state) = pair
-        parse_triples(state, base, prefixes, list.append(triples, acc))
-      })
-  }
-}
-
-fn parse_triple(
+/// `subject predicateObjectList`, without the terminating `.`.
+fn parse_triples_statement(
   state: ParserState,
   base: Option(String),
   prefixes: dict.Dict(String, String),
@@ -901,11 +1197,6 @@ fn parse_triple(
   |> result.try(fn(pair) {
     let #(subject, state) = pair
     parse_predicate_object_list(state, subject, base, prefixes, [])
-    |> result.try(fn(pair2) {
-      let #(triples, state) = pair2
-      consume_dot(state)
-      |> result.map(fn(state) { #(triples, state) })
-    })
   })
 }
 
@@ -929,8 +1220,10 @@ fn parse_predicate_object_list(
       case consume_if(state, Semicolon) {
         Ok(#(True, state)) ->
           case peek(state) {
-            Some(Token(Dot, _)) | Some(Token(Semicolon, _)) | None ->
-              Ok(#(combined, state))
+            Some(Token(Dot, _))
+            | Some(Token(Semicolon, _))
+            | Some(Token(GraphEnd, _))
+            | None -> Ok(#(combined, state))
             _ ->
               parse_predicate_object_list(
                 state,
@@ -970,6 +1263,7 @@ fn parse_subject(
   base: Option(String),
   prefixes: dict.Dict(String, String),
 ) -> Result(#(term.Subject, ParserState), TurtleError) {
+  use <- triple_term_or(state, base, prefixes, term.SubjectTriple)
   consume_token(state, fn(token) {
     case token {
       Token(IriRef(iri), pos) ->
@@ -1026,67 +1320,87 @@ fn parse_predicate(
   })
 }
 
-// duplicate parse_object removed
+/// Parses a triple term `<<( subject predicate object )>>` when one starts
+/// at the head of `state` and wraps it with `wrap`; otherwise runs
+/// `otherwise`. Like the N-Triples parser, triple terms are accepted as
+/// subjects as well as objects, and they may nest.
+fn triple_term_or(
+  state: ParserState,
+  base: Option(String),
+  prefixes: dict.Dict(String, String),
+  wrap: fn(term.TripleTerm) -> a,
+  otherwise: fn() -> Result(#(a, ParserState), TurtleError),
+) -> Result(#(a, ParserState), TurtleError) {
+  case peek(state) {
+    Some(Token(TripleTermStart, _)) -> {
+      use #(subject, state) <- result.try(parse_subject(
+        drop_one(state),
+        base,
+        prefixes,
+      ))
+      use #(predicate, state) <- result.try(parse_predicate(
+        state,
+        base,
+        prefixes,
+      ))
+      use #(object, state) <- result.try(parse_object(state, base, prefixes))
+      use #(_, state) <- result.map(
+        consume_token(state, fn(token) {
+          case token {
+            Token(TripleTermEnd, _) -> Ok(Nil)
+            _ ->
+              Error(TurtleError(
+                "Expected ')>>' to close the triple term",
+                token_position(token),
+              ))
+          }
+        }),
+      )
+      #(wrap(term.triple_term(subject, predicate, object)), state)
+    }
+    _ -> otherwise()
+  }
+}
 
+/// The optional `LANG_DIR` or `^^datatype` suffix after a string.
 fn parse_post_string(
   value: String,
   state: ParserState,
   base: Option(String),
   prefixes: dict.Dict(String, String),
-  pos: Int,
 ) -> Result(#(term.Object, ParserState), TurtleError) {
-  case consume_if(state, LangTag("")) {
-    // The dummy value above is never matched; handled below with peek
-    _ ->
-      case peek(state) {
-        Some(Token(LangTag(tag), _)) -> {
-          let state = drop_one(state)
-          term.language_tag(tag)
-          |> result.map_error(fn(_) { TurtleError("Invalid language tag", pos) })
-          |> result.map(fn(lang) {
-            #(
-              term.ObjectLiteral(term.LanguageTaggedLiteral(value, lang)),
-              state,
-            )
-          })
+  case peek(state) {
+    Some(Token(LangTag(lang_dir), tag_pos)) ->
+      rdf_syntax.lang_dir_literal(value, lang_dir)
+      |> result.map_error(TurtleError(_, tag_pos))
+      |> result.map(fn(literal) {
+        #(term.ObjectLiteral(literal), drop_one(state))
+      })
+    Some(Token(HatHat, _)) ->
+      consume_token(drop_one(state), fn(token) {
+        case token {
+          Token(IriRef(iri), pos) ->
+            apply_base(iri, base, pos)
+            |> result.try(fn(resolved) {
+              term.named_node(resolved)
+              |> result.map_error(fn(_) { TurtleError("Invalid datatype", pos) })
+            })
+          Token(Prefixed(prefix, local), pos) ->
+            resolve_prefixed(prefixes, prefix, local, pos)
+            |> result.try(fn(iri) {
+              term.named_node(iri)
+              |> result.map_error(fn(_) { TurtleError("Invalid datatype", pos) })
+            })
+          _ ->
+            Error(TurtleError("Expected datatype IRI", token_position(token)))
         }
-        Some(Token(HatHat, _)) -> {
-          let state = drop_one(state)
-          consume_token(state, fn(token) {
-            case token {
-              Token(IriRef(iri), pos2) ->
-                apply_base(iri, base, pos2)
-                |> result.try(fn(resolved) {
-                  term.named_node(resolved)
-                  |> result.map_error(fn(_) {
-                    TurtleError("Invalid datatype", pos2)
-                  })
-                  |> result.map(fn(node) {
-                    term.ObjectLiteral(term.TypedLiteral(value, node))
-                  })
-                })
-              Token(Prefixed(prefix, local), pos2) ->
-                resolve_prefixed(prefixes, prefix, local, pos2)
-                |> result.try(fn(iri) {
-                  term.named_node(iri)
-                  |> result.map_error(fn(_) {
-                    TurtleError("Invalid datatype", pos2)
-                  })
-                  |> result.map(fn(node) {
-                    term.ObjectLiteral(term.TypedLiteral(value, node))
-                  })
-                })
-              _ ->
-                Error(TurtleError(
-                  "Expected datatype IRI",
-                  token_position(token),
-                ))
-            }
-          })
-          |> result.map(fn(pair) { pair })
-        }
-        _ -> Ok(#(term.ObjectLiteral(term.SimpleLiteral(value)), state))
-      }
+        |> result.try(fn(datatype) {
+          rdf_syntax.typed_literal(value, datatype)
+          |> result.map(term.ObjectLiteral)
+          |> result.map_error(TurtleError(_, token_position(token)))
+        })
+      })
+    _ -> Ok(#(term.ObjectLiteral(term.SimpleLiteral(value)), state))
   }
 }
 
@@ -1135,6 +1449,7 @@ fn parse_object(
   base: Option(String),
   prefixes: dict.Dict(String, String),
 ) -> Result(#(term.Object, ParserState), TurtleError) {
+  use <- triple_term_or(state, base, prefixes, term.ObjectTriple)
   pop(state)
   |> result.try(fn(pair) {
     let #(token, state_after) = pair
@@ -1157,8 +1472,8 @@ fn parse_object(
         term.blank_node(label)
         |> result.map_error(fn(_) { TurtleError("Invalid blank node", pos) })
         |> result.map(fn(node) { #(term.ObjectBlank(node), state_after) })
-      Token(StringLiteral(value), pos) ->
-        parse_post_string(value, state_after, base, prefixes, pos)
+      Token(StringLiteral(value), _) ->
+        parse_post_string(value, state_after, base, prefixes)
       Token(NumberLiteral(kind, text), _) ->
         Ok(#(number_literal(kind, text), state_after))
       Token(BooleanLiteral(value), _) ->
@@ -1197,11 +1512,6 @@ fn keyword_matches(actual: TokenKind, expected: TokenKind) -> Bool {
     Comma ->
       case expected {
         Comma -> True
-        _ -> False
-      }
-    LangTag(_) ->
-      case expected {
-        LangTag(_) -> True
         _ -> False
       }
     _ -> False
@@ -1448,15 +1758,24 @@ fn recompose_iri(ref: IriReference) -> String {
 }
 
 fn serialize_document(document: TurtleDocument) -> String {
+  // A label that is not a valid PN_PREFIX could not be read back, so such
+  // prefixes are neither declared nor used.
+  let document =
+    TurtleDocument(
+      ..document,
+      prefixes: dict.filter(document.prefixes, fn(name, _) {
+        turtle_names.is_valid_prefix(name)
+      }),
+    )
   let base_lines = case document.base {
-    Some(base) -> ["@base <" <> escape_iri(base) <> "> ."]
+    Some(base) -> ["@base <" <> rdf_syntax.escape_iri(base) <> "> ."]
     None -> []
   }
   let prefix_lines =
-    dict.to_list(document.prefixes)
+    turtle_names.sorted_prefixes(document.prefixes)
     |> list.map(fn(pair) {
       let #(name, iri) = pair
-      "@prefix " <> name <> ": <" <> escape_iri(iri) <> "> ."
+      "@prefix " <> name <> ": <" <> rdf_syntax.escape_iri(iri) <> "> ."
     })
   let triple_lines =
     graph.triples(document.graph)
@@ -1524,7 +1843,7 @@ fn serialize_triple_term(
   let subj_str = serialize_subject(subject, prefixes)
   let pred_str = serialize_predicate(predicate, prefixes)
   let obj_str = serialize_object(object, prefixes)
-  "<<" <> subj_str <> " " <> pred_str <> " " <> obj_str <> ">>"
+  "<<( " <> subj_str <> " " <> pred_str <> " " <> obj_str <> " )>>"
 }
 
 fn serialize_named_node(
@@ -1532,13 +1851,9 @@ fn serialize_named_node(
   prefixes: dict.Dict(String, String),
 ) -> String {
   let term.NamedNode(value) = node
-  case find_prefix(value, prefixes) {
-    Some(#(name, local)) ->
-      case name == "" {
-        True -> ":" <> local
-        False -> name <> ":" <> local
-      }
-    None -> "<" <> escape_iri(value) <> ">"
+  case turtle_names.compact_iri(value, prefixes) {
+    Some(prefixed_name) -> prefixed_name
+    None -> "<" <> rdf_syntax.escape_iri(value) <> ">"
   }
 }
 
@@ -1547,97 +1862,27 @@ fn serialize_literal(
   prefixes: dict.Dict(String, String),
 ) -> String {
   case literal {
-    term.SimpleLiteral(value) -> "\"" <> escape_string(value) <> "\""
+    term.SimpleLiteral(value) -> "\"" <> rdf_syntax.escape_string(value) <> "\""
     term.LanguageTaggedLiteral(value, tag) -> {
       let term.LanguageTag(lang) = tag
-      "\"" <> escape_string(value) <> "\"@" <> lang
+      "\"" <> rdf_syntax.escape_string(value) <> "\"@" <> lang
     }
+    term.DirectionalLanguageTaggedLiteral(value, term.LanguageTag(lang), dir) ->
+      "\""
+      <> rdf_syntax.escape_string(value)
+      <> "\"@"
+      <> lang
+      <> "--"
+      <> term.base_direction_to_string(dir)
     term.TypedLiteral(value, datatype) -> {
       let term.NamedNode(dt) = datatype
-      case
-        dt == xsd_integer || dt == xsd_decimal || dt == xsd_double,
-        dt == xsd_boolean
-      {
-        True, _ -> value
-        _, True -> value
-        _, _ -> {
+      case turtle_names.is_bare_literal(value, dt) {
+        True -> value
+        False -> {
           let dt_text = serialize_named_node(datatype, prefixes)
-          "\"" <> escape_string(value) <> "\"^^" <> dt_text
+          "\"" <> rdf_syntax.escape_string(value) <> "\"^^" <> dt_text
         }
       }
     }
-  }
-}
-
-fn escape_string(value: String) -> String {
-  string.to_graphemes(value)
-  |> list.map(fn(char) {
-    case char {
-      "\\" -> "\\\\"
-      "\"" -> "\\\""
-      "\n" -> "\\n"
-      "\r" -> "\\r"
-      "\t" -> "\\t"
-      _ -> char
-    }
-  })
-  |> string.concat
-}
-
-fn escape_iri(value: String) -> String {
-  string.to_graphemes(value)
-  |> list.map(fn(char) {
-    case char {
-      "\\" -> "\\\\"
-      ">" -> "\\>"
-      _ -> char
-    }
-  })
-  |> string.concat
-}
-
-fn find_prefix(
-  iri: String,
-  prefixes: dict.Dict(String, String),
-) -> Option(#(String, String)) {
-  let best =
-    dict.to_list(prefixes)
-    |> list.fold(None, fn(current, entry) {
-      let #(name, ns) = entry
-      // Strip the namespace with split_once rather than string.drop_start:
-      // on the JavaScript target drop_start mixes UTF-8 byte and UTF-16 unit
-      // offsets, which corrupts the local name for non-ASCII namespaces.
-      case ns != "" && string.starts_with(iri, ns) {
-        True ->
-          case string.split_once(iri, ns) {
-            Ok(#("", local)) -> {
-              let ns_len = string.length(ns)
-              case current {
-                None -> Some(#(name, local, ns_len))
-                Some(#(best_name, best_local, best_len)) ->
-                  case ns_len > best_len {
-                    True -> Some(#(name, local, ns_len))
-                    False -> Some(#(best_name, best_local, best_len))
-                  }
-              }
-            }
-            _ -> current
-          }
-        False -> current
-      }
-    })
-  case best {
-    Some(#(name, local, _)) -> Some(#(name, local))
-    None -> None
-  }
-}
-
-fn is_whitespace_char(char: String) -> Bool {
-  case char {
-    " " -> True
-    "\t" -> True
-    "\n" -> True
-    "\r" -> True
-    _ -> False
   }
 }

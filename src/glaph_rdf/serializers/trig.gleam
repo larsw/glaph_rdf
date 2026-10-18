@@ -4,6 +4,8 @@
 
 import glaph_rdf/dataset
 import glaph_rdf/graph
+import glaph_rdf/internal/rdf_syntax
+import glaph_rdf/internal/turtle_names
 import glaph_rdf/internal/utf8
 import glaph_rdf/statement
 import glaph_rdf/term
@@ -59,10 +61,13 @@ pub type TrigDocument {
 
 /// Parse a TriG document from text into a structured representation.
 ///
-/// Parses TriG syntax including base declarations, prefix definitions, and
-/// named graph blocks with `GRAPH` statements. Falls back to Turtle parsing
-/// if no TriG-specific syntax is detected. Supports RDF-star quoted triples
-/// within all graphs. Returns detailed error information on parse failures.
+/// Parses the Turtle statements the Turtle parser supports plus TriG graph
+/// blocks: `{ ... }` (default graph), `label { ... }` and
+/// `GRAPH label { ... }`, where the label is an IRI, prefixed name or blank
+/// node. Directives may appear between blocks. RDF 1.2 triple terms
+/// (`<<( s p o )>>`) and directional language-tagged strings (`"x"@en--ltr`)
+/// are supported in every graph. Returns detailed error information on parse
+/// failures.
 ///
 /// ## Examples
 /// ```gleam
@@ -86,37 +91,18 @@ pub type TrigDocument {
 /// }
 /// ```
 pub fn parse(text: String) -> Result(TrigDocument, TrigError) {
-  // Simple TriG parser - for now, handle basic cases
-  // TODO: Implement full TriG grammar with named graphs
-
-  // Check if this looks like TriG (has GRAPH or {...} blocks)
-  case string.contains(text, "GRAPH ") || string.contains(text, " {") {
-    True -> parse_trig_format(text)
-    False -> {
-      // Parse as turtle and convert to TriG document
-      case turtle.parse(text) {
-        Ok(turtle_doc) -> {
-          let dataset_with_default =
-            dataset.new()
-            |> dataset.replace_graph(term.DefaultGraph, turtle_doc.graph)
-
-          Ok(TrigDocument(
-            base: turtle_doc.base,
-            prefixes: turtle_doc.prefixes,
-            dataset: dataset_with_default,
-          ))
-        }
-        Error(turtle.TurtleError(message, position)) ->
-          Error(TrigError(message, position))
-      }
-    }
+  // The Turtle parser with graph blocks enabled. It skips one leading byte
+  // order mark, so it is not stripped here as well.
+  case turtle.parse_trig(text) {
+    Ok(#(base, prefixes, quads)) ->
+      Ok(TrigDocument(
+        base: base,
+        prefixes: prefixes,
+        dataset: dataset.from_list(quads),
+      ))
+    Error(turtle.TurtleError(message, position)) ->
+      Error(TrigError(message, position))
   }
-}
-
-fn parse_trig_format(_text: String) -> Result(TrigDocument, TrigError) {
-  // For now, return empty TriG document - this needs full implementation
-  // TODO: Implement proper TriG parser with GRAPH blocks
-  Ok(TrigDocument(base: None, prefixes: dict.new(), dataset: dataset.new()))
 }
 
 /// Parse a TriG document and extract only the RDF dataset content.
@@ -341,16 +327,25 @@ pub fn serialize_dataset_to_file(
 }
 
 fn serialize_document(document: TrigDocument) -> String {
+  // A label that is not a valid PN_PREFIX could not be read back, so such
+  // prefixes are neither declared nor used.
+  let document =
+    TrigDocument(
+      ..document,
+      prefixes: dict.filter(document.prefixes, fn(name, _) {
+        turtle_names.is_valid_prefix(name)
+      }),
+    )
   let base_lines = case document.base {
-    Some(base) -> ["@base <" <> escape_iri(base) <> "> ."]
+    Some(base) -> ["@base <" <> rdf_syntax.escape_iri(base) <> "> ."]
     None -> []
   }
 
   let prefix_lines =
-    dict.to_list(document.prefixes)
+    turtle_names.sorted_prefixes(document.prefixes)
     |> list.map(fn(pair) {
       let #(name, iri) = pair
-      "@prefix " <> name <> ": <" <> escape_iri(iri) <> "> ."
+      "@prefix " <> name <> ": <" <> rdf_syntax.escape_iri(iri) <> "> ."
     })
 
   // Serialize default graph triples (if any)
@@ -471,7 +466,7 @@ fn serialize_triple_term(
   let subj_str = serialize_subject(subject, prefixes)
   let pred_str = serialize_predicate(predicate, prefixes)
   let obj_str = serialize_object(object, prefixes)
-  "<<" <> subj_str <> " " <> pred_str <> " " <> obj_str <> ">>"
+  "<<( " <> subj_str <> " " <> pred_str <> " " <> obj_str <> " )>>"
 }
 
 fn serialize_named_node(
@@ -479,13 +474,9 @@ fn serialize_named_node(
   prefixes: dict.Dict(String, String),
 ) -> String {
   let term.NamedNode(value) = node
-  case find_prefix(value, prefixes) {
-    Some(#(name, local)) ->
-      case name == "" {
-        True -> ":" <> local
-        False -> name <> ":" <> local
-      }
-    None -> "<" <> escape_iri(value) <> ">"
+  case turtle_names.compact_iri(value, prefixes) {
+    Some(prefixed_name) -> prefixed_name
+    None -> "<" <> rdf_syntax.escape_iri(value) <> ">"
   }
 }
 
@@ -494,89 +485,27 @@ fn serialize_literal(
   prefixes: dict.Dict(String, String),
 ) -> String {
   case literal {
-    term.SimpleLiteral(value) -> "\"" <> escape_string(value) <> "\""
+    term.SimpleLiteral(value) -> "\"" <> rdf_syntax.escape_string(value) <> "\""
     term.LanguageTaggedLiteral(value, tag) -> {
       let term.LanguageTag(lang) = tag
-      "\"" <> escape_string(value) <> "\"@" <> lang
+      "\"" <> rdf_syntax.escape_string(value) <> "\"@" <> lang
     }
+    term.DirectionalLanguageTaggedLiteral(value, term.LanguageTag(lang), dir) ->
+      "\""
+      <> rdf_syntax.escape_string(value)
+      <> "\"@"
+      <> lang
+      <> "--"
+      <> term.base_direction_to_string(dir)
     term.TypedLiteral(value, datatype) -> {
       let term.NamedNode(dt) = datatype
-      case
-        dt == "http://www.w3.org/2001/XMLSchema#integer"
-        || dt == "http://www.w3.org/2001/XMLSchema#decimal"
-        || dt == "http://www.w3.org/2001/XMLSchema#double",
-        dt == "http://www.w3.org/2001/XMLSchema#boolean"
-      {
-        True, _ -> value
-        _, True -> value
-        _, _ -> {
+      case turtle_names.is_bare_literal(value, dt) {
+        True -> value
+        False -> {
           let dt_text = serialize_named_node(datatype, prefixes)
-          "\"" <> escape_string(value) <> "\"^^" <> dt_text
+          "\"" <> rdf_syntax.escape_string(value) <> "\"^^" <> dt_text
         }
       }
     }
   }
-}
-
-fn find_prefix(
-  iri: String,
-  prefixes: dict.Dict(String, String),
-) -> Option(#(String, String)) {
-  let best =
-    dict.to_list(prefixes)
-    |> list.fold(None, fn(current, entry) {
-      let #(name, ns) = entry
-      // Strip the namespace with split_once rather than string.drop_start:
-      // on the JavaScript target drop_start mixes UTF-8 byte and UTF-16 unit
-      // offsets, which corrupts the local name for non-ASCII namespaces.
-      case ns != "" && string.starts_with(iri, ns) {
-        True ->
-          case string.split_once(iri, ns) {
-            Ok(#("", local)) -> {
-              let ns_len = string.length(ns)
-              case current {
-                None -> Some(#(name, local, ns_len))
-                Some(#(best_name, best_local, best_len)) ->
-                  case ns_len > best_len {
-                    True -> Some(#(name, local, ns_len))
-                    False -> Some(#(best_name, best_local, best_len))
-                  }
-              }
-            }
-            _ -> current
-          }
-        False -> current
-      }
-    })
-  case best {
-    Some(#(name, local, _)) -> Some(#(name, local))
-    None -> None
-  }
-}
-
-fn escape_string(value: String) -> String {
-  string.to_graphemes(value)
-  |> list.map(fn(char) {
-    case char {
-      "\\" -> "\\\\"
-      "\"" -> "\\\""
-      "\n" -> "\\n"
-      "\r" -> "\\r"
-      "\t" -> "\\t"
-      _ -> char
-    }
-  })
-  |> string.concat
-}
-
-fn escape_iri(value: String) -> String {
-  string.to_graphemes(value)
-  |> list.map(fn(char) {
-    case char {
-      "\\" -> "\\\\"
-      ">" -> "\\>"
-      _ -> char
-    }
-  })
-  |> string.concat
 }
